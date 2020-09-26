@@ -307,16 +307,15 @@ public final class LocalLogManager implements MetaLogManager {
         private final FileChannel logChannel;
         private final Listener listener;
         private final long logCheckIntervalMs;
-        private final MetadataParser parser = new MetadataParser();
         private boolean shuttingDown = false;
         private boolean shouldLead = false;
         private long nextLogCheckMs = 0;
         private List<ApiMessageAndVersion> incomingWrites = null;
         private ScribeState state = ScribeState.FOLLOWER;
         private LeaderInfo leaderInfo = new LeaderInfo(-1, -1);
-        private long index = 0;
-        private long nextWriteIndex = 0;
-        private long fileOffset = 0;
+        private long logOffset = 0;
+        private long nextLogOffsetToWrite = 0;
+        private long filePosition = 0;
         private final ByteBuffer frameBuffer = ByteBuffer.allocate(FRAME_LENGTH);
         private ByteBuffer dataBuffer = EMPTY;
 
@@ -355,9 +354,8 @@ public final class LocalLogManager implements MetaLogManager {
                                 if (claim != null) {
                                     state = ScribeState.LEADER;
                                     incomingWrites = null;
+                                    nextLogOffsetToWrite = logOffset;
                                     leaderInfo = claim;
-                                    index = 0;
-                                    nextWriteIndex = 0;
                                     shouldClaimEpoch = leaderInfo.epoch;
                                     claimedCond.signalAll();
                                 } else {
@@ -437,7 +435,7 @@ public final class LocalLogManager implements MetaLogManager {
                                 }
                             } while (result > 0);
                             if (curState == ScribeState.BECOMING_LEADER && result == 0) {
-                                // If the result is 0, that means did not read a partial
+                                // If the result is 0, that means we did not read a partial
                                 // record at the end.  So we should be ready to write our
                                 // claim to the file.
                                 claim = new LeaderInfo(nodeId, leaderInfo.epoch + 1);
@@ -450,9 +448,9 @@ public final class LocalLogManager implements MetaLogManager {
                             if (toWrite != null) {
                                 for (ApiMessageAndVersion message : toWrite) {
                                     writeMessage(message);
-                                    listener.handleCommit(leaderInfo.epoch, index,
+                                    listener.handleCommit(leaderInfo.epoch, logOffset,
                                         message.message());
-                                    index++;
+                                    logOffset++;
                                 }
                             }
                             break;
@@ -506,14 +504,14 @@ public final class LocalLogManager implements MetaLogManager {
          */
         private int readNextMessage() throws IOException {
             frameBuffer.clear();
-            int frameLength = readData(frameBuffer, fileOffset);
+            int frameLength = readData(frameBuffer, filePosition);
             if (frameLength <= 0) {
                 return frameLength;
             }
             int frameInt = frameBuffer.getInt();
             int length = frameInt < 0 ? -frameInt : frameInt;
             setupDataBuffer(length);
-            int dataLength = readData(dataBuffer, fileOffset + FRAME_LENGTH);
+            int dataLength = readData(dataBuffer, filePosition + FRAME_LENGTH);
             if (dataLength < 0) {
                 return -FRAME_LENGTH + dataLength;
             }
@@ -521,10 +519,10 @@ public final class LocalLogManager implements MetaLogManager {
                 leaderInfo = LeaderInfo.read(dataBuffer);
             } else {
                 ApiMessage message = MetadataParser.read(dataBuffer);
-                listener.handleCommit(leaderInfo.epoch, index, message);
-                index++;
+                listener.handleCommit(leaderInfo.epoch, logOffset, message);
+                logOffset++;
             }
-            fileOffset += FRAME_LENGTH + dataLength;
+            filePosition += FRAME_LENGTH + dataLength;
             return FRAME_LENGTH + dataLength;
         }
 
@@ -532,16 +530,16 @@ public final class LocalLogManager implements MetaLogManager {
          * Read data from the log into a provided buffer.
          *
          * @param buf           The buffer to read the data into.
-         * @param curOffset     The offset in the file to read from.
+         * @param curPosition   The position in the file to read from.
          *
          * @return              A negative number if we got a partial message.
          *                      0 if we hit EOF.
          *                      The positive size of what we read, if we read everything.
          */
-        private int readData(ByteBuffer buf, long curOffset) throws IOException {
+        private int readData(ByteBuffer buf, long curPosition) throws IOException {
             int numRead = 0;
             while (buf.hasRemaining()) {
-                int result = logChannel.read(buf, curOffset + buf.position());
+                int result = logChannel.read(buf, curPosition + buf.position());
                 if (result < 0) {
                     return -numRead;
                 }
@@ -596,9 +594,9 @@ public final class LocalLogManager implements MetaLogManager {
         private void writeBuffer(ByteBuffer buf) throws IOException {
             int size = buf.remaining();
             while (buf.hasRemaining()) {
-                logChannel.write(buf, fileOffset + buf.position());
+                logChannel.write(buf, filePosition + buf.position());
             }
-            fileOffset += size;
+            filePosition += size;
         }
 
         void beginShutdown() {
@@ -646,17 +644,17 @@ public final class LocalLogManager implements MetaLogManager {
         long scheduleWrite(long epoch, ApiMessageAndVersion message) {
             lock.lock();
             try {
-                if (shuttingDown || leaderInfo.epoch != epoch) {
+                if (shuttingDown || leaderInfo.epoch != epoch || state != ScribeState.LEADER) {
                     return Long.MAX_VALUE;
                 }
                 if (incomingWrites == null) {
                     incomingWrites = new ArrayList<>();
                 }
                 incomingWrites.add(message);
-                long curWriteIndex = nextWriteIndex;
-                nextWriteIndex++;
+                long offset = nextLogOffsetToWrite;
+                nextLogOffsetToWrite++;
                 wakeCond.signal();
-                return curWriteIndex;
+                return offset;
             } finally {
                 lock.unlock();
             }

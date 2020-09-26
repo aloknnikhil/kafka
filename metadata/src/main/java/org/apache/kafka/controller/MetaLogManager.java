@@ -32,10 +32,10 @@ public interface MetaLogManager extends AutoCloseable {
          * Called when the MetaLogManager commits a message.
          *
          * @param epoch         The controller epoch of the message.
-         * @param index         The index of the message within the controller epoch.
+         * @param offset        The offset of the message.
          * @param message       The message.
          */
-        void handleCommit(long epoch, long index, ApiMessage message);
+        void handleCommit(long epoch, long offset, ApiMessage message);
 
         /**
          * Called when the MetaLogManager has claimed the leadership.
@@ -64,13 +64,13 @@ public interface MetaLogManager extends AutoCloseable {
      * The write will be scheduled to happen at some time in the future.  There is no
      * error return or exception thrown if the write fails.  Instead, the listener may
      * regard the write as successful if and only if the MetaLogManager reaches the given
-     * index before renouncing its leadership.  The listener should determine this by
-     * monitoring the committed indexes.
+     * offset before renouncing its leadership.  The listener should determine this by
+     * monitoring the committed offsets.
      *
      * @param epoch         The controller epoch.
      * @param message       The message to write and the version to use.
      *
-     * @return              The index of the message.
+     * @return              The offset of the message.
      */
     long scheduleWrite(long epoch, ApiMessageAndVersion message);
 

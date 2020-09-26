@@ -29,7 +29,7 @@ public class MockMetaLogManagerListener implements MetaLogManager.Listener {
     private long curEpoch = -1;
 
     interface CommitHandler {
-        void handle(int nodeId, long epoch, long index, ApiMessage message) throws Exception;
+        void handle(int nodeId, long epoch, long offset, ApiMessage message) throws Exception;
     }
 
     MockMetaLogManagerListener(AtomicReference<String> firstError,
@@ -41,12 +41,12 @@ public class MockMetaLogManagerListener implements MetaLogManager.Listener {
     }
 
     @Override
-    public void handleCommit(long epoch, long index, ApiMessage message) {
+    public void handleCommit(long epoch, long offset, ApiMessage message) {
         try {
-            commitHandler.handle(nodeId, epoch, index, message);
+            commitHandler.handle(nodeId, epoch, offset, message);
         } catch (Exception e) {
             firstError.compareAndSet(null, "error handling commit(epoch=" + epoch +
-                ", index=" + index + ", message=" + message + "): " +
+                ", offset=" + offset + ", message=" + message + "): " +
                 e.getClass().getSimpleName() + ": " + e.getMessage());
         }
     }
