@@ -34,7 +34,6 @@ import org.apache.kafka.common.message.UpdateMetadataRequestData.UpdateMetadataP
 import org.apache.kafka.common.{Cluster, Node, PartitionInfo, TopicPartition}
 import org.apache.kafka.common.message.MetadataResponseData.MetadataResponseTopic
 import org.apache.kafka.common.message.MetadataResponseData.MetadataResponsePartition
-import org.apache.kafka.common.message.UpdateMetadataRequestData
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.requests.{MetadataResponse, UpdateMetadataRequest}
@@ -286,20 +285,16 @@ class MetadataCache(brokerId: Int) extends Logging {
 
   // This method returns the deleted TopicPartitions received from UpdateMetadataRequest
   def updateMetadata(correlationId: Int, updateMetadataRequest: UpdateMetadataRequest): Seq[TopicPartition] = {
-    updateMetadata(correlationId, updateMetadataRequest.data, updateMetadataRequest.version)
-  }
-
-  def updateMetadata(correlationId: Int, data: UpdateMetadataRequestData, version: Short): Seq[TopicPartition] = {
     inWriteLock(partitionMetadataLock) {
 
       val aliveBrokers = new mutable.LongMap[Broker](metadataSnapshot.aliveBrokers.size)
       val aliveNodes = new mutable.LongMap[collection.Map[ListenerName, Node]](metadataSnapshot.aliveNodes.size)
-      val controllerIdOpt = data.controllerId match {
+      val controllerIdOpt = updateMetadataRequest.controllerId match {
           case id if id < 0 => None
           case id => Some(id)
         }
 
-      data.liveBrokers.forEach { broker =>
+      updateMetadataRequest.liveBrokers.forEach { broker =>
         // `aliveNodes` is a hot path for metadata requests for large clusters, so we use java.util.HashMap which
         // is a bit faster than scala.collection.mutable.HashMap. When we drop support for Scala 2.10, we could
         // move to `AnyRefMap`, which has comparable performance.
@@ -320,7 +315,7 @@ class MetadataCache(brokerId: Int) extends Logging {
       }
 
       val deletedPartitions = new mutable.ArrayBuffer[TopicPartition]
-      if (!UpdateMetadataRequest.partitionStates(data, version).iterator.hasNext) {
+      if (!updateMetadataRequest.partitionStates.iterator.hasNext) {
         metadataSnapshot = MetadataSnapshot(metadataSnapshot.partitionStates, controllerIdOpt, aliveBrokers, aliveNodes)
       } else {
         //since kafka may do partial metadata updates, we start by copying the previous state
@@ -332,9 +327,9 @@ class MetadataCache(brokerId: Int) extends Logging {
         }
 
         val traceEnabled = stateChangeLogger.isTraceEnabled
-        val controllerId = data.controllerId
-        val controllerEpoch = data.controllerEpoch
-        val newStates = UpdateMetadataRequest.partitionStates(data, version).asScala
+        val controllerId = updateMetadataRequest.controllerId
+        val controllerEpoch = updateMetadataRequest.controllerEpoch
+        val newStates = updateMetadataRequest.partitionStates.asScala
         newStates.foreach { state =>
           // per-partition logging here can be very expensive due going through all partitions in the cluster
           val tp = new TopicPartition(state.topicName, state.partitionIndex)

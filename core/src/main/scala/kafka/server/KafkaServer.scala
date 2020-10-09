@@ -168,7 +168,7 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
 
   var kafkaController: KafkaController = null
 
-  var raftEventManager: BrokerRaftEventManager = null
+  var metadataEventManager: BrokerMetadataEventManager = null
 
   var brokerToControllerChannelManager: BrokerToControllerChannelManager = null
 
@@ -227,8 +227,7 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
       if (canStartup) {
         brokerState.newState(Starting)
 
-        raftEventManager.put(StartupBeforeAnyProcessing)
-        raftEventManager.start()
+        metadataEventManager.start()
 
         /* setup zookeeper */
         initZkClient(time)
@@ -330,7 +329,7 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         groupCoordinator = GroupCoordinator(config, zkClient, replicaManager, Time.SYSTEM, metrics)
         groupCoordinator.startup()
 
-        raftEventManager = new BrokerRaftEventManager(replicaManager, groupCoordinator, metadataCache, quotaManagers, clusterId, time)
+        metadataEventManager = new BrokerMetadataEventManager(replicaManager, groupCoordinator, metadataCache, quotaManagers, clusterId, time)
 
         /* start transaction coordinator, with a separate background thread scheduler for transaction expiration and log loading */
         // Hardcode Time.SYSTEM for now as some Streams tests fail otherwise, it would be good to fix the underlying issue
@@ -679,8 +678,8 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         CoreUtils.swallow(controlledShutdown(), this)
         brokerState.newState(BrokerShuttingDown)
 
-        if (raftEventManager != null)
-          raftEventManager.close()
+        if (metadataEventManager != null)
+          metadataEventManager.close()
 
         if (dynamicConfigManager != null)
           CoreUtils.swallow(dynamicConfigManager.shutdown(), this)

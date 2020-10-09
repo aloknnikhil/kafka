@@ -193,11 +193,7 @@ public class UpdateMetadataRequest extends AbstractControlRequest {
     }
 
     public Iterable<UpdateMetadataPartitionState> partitionStates() {
-        return partitionStates(data, version());
-    }
-
-    public static Iterable<UpdateMetadataPartitionState> partitionStates(UpdateMetadataRequestData data, short version) {
-        if (version >= 5) {
+        if (version() >= 5) {
             return () -> new FlattenedIterator<>(data.topicStates().iterator(),
                 topicState -> topicState.partitionStates().iterator());
         }
