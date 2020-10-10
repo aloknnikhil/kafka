@@ -34,6 +34,7 @@ import org.apache.kafka.common.message.UpdateMetadataRequestData.UpdateMetadataP
 import org.apache.kafka.common.{Cluster, Node, PartitionInfo, TopicPartition}
 import org.apache.kafka.common.message.MetadataResponseData.MetadataResponseTopic
 import org.apache.kafka.common.message.MetadataResponseData.MetadataResponsePartition
+import org.apache.kafka.common.metadata.BrokerRecord
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.requests.{MetadataResponse, UpdateMetadataRequest}
@@ -308,11 +309,7 @@ class MetadataCache(brokerId: Int) extends Logging {
         aliveBrokers(broker.id) = Broker(broker.id, endPoints, Option(broker.rack))
         aliveNodes(broker.id) = nodes.asScala
       }
-      aliveNodes.get(brokerId).foreach { listenerMap =>
-        val listeners = listenerMap.keySet
-        if (!aliveNodes.values.forall(_.keySet == listeners))
-          error(s"Listeners are not identical across brokers: $aliveNodes")
-      }
+      logListenersNotIdenticalIfNecessary(aliveNodes)
 
       val deletedPartitions = new mutable.ArrayBuffer[TopicPartition]
       if (!updateMetadataRequest.partitionStates.iterator.hasNext) {
@@ -353,6 +350,84 @@ class MetadataCache(brokerId: Int) extends Logging {
         metadataSnapshot = MetadataSnapshot(partitionStates, controllerIdOpt, aliveBrokers, aliveNodes)
       }
       deletedPartitions
+    }
+  }
+
+  private def logListenersNotIdenticalIfNecessary(aliveNodes: mutable.LongMap[collection.Map[ListenerName, Node]]) = {
+    aliveNodes.get(brokerId).foreach { listenerMap =>
+      val listeners = listenerMap.keySet
+      if (!aliveNodes.values.forall(_.keySet == listeners))
+        error(s"Listeners are not identical across brokers: $aliveNodes")
+    }
+  }
+
+  private def different(brokerRecord: BrokerRecord, broker: Broker): Boolean = {
+    if (brokerRecord.brokerId() != broker.id) {
+      return true
+    }
+    val brokerRecordRack = brokerRecord.rack()
+    // not sure if "" may imply no rack since BrokerRecord default constructor sets this.rack=""
+    val brokerRecordHasRack = brokerRecordRack != null && brokerRecordRack != ""
+    if (!brokerRecordHasRack && broker.rack.isDefined || brokerRecordHasRack && broker.rack.isEmpty) {
+      return true
+    }
+    broker.rack.foreach( rack => if (rack != brokerRecordRack) return true)
+    // We are going to have to compare sizes no matter what, so do that first even if this Seq implementation is O(n)
+    if (broker.endPoints.size != brokerRecord.endPoints().size()) {
+      return true
+    }
+    broker.endPoints.foreach(brokerEndPoint => {
+      val brokerRecordEndpoint = brokerRecord.endPoints().find(brokerEndPoint.listenerName.value())
+      if (brokerRecordEndpoint == null) {
+        return true
+      }
+      if (brokerEndPoint.host != brokerRecordEndpoint.host() ||
+        brokerEndPoint.port != brokerRecordEndpoint.port() ||
+        brokerEndPoint.securityProtocol.id != brokerRecordEndpoint.securityProtocol()) {
+        return true
+      }
+    })
+    false
+  }
+
+  def updateMetadata(brokerRecord: BrokerRecord): Unit = {
+    inWriteLock(partitionMetadataLock) {
+      /*
+      * Upsert the single given broker while doing nothing if there is no change
+      */
+      val upsertBrokerId = brokerRecord.brokerId()
+      val existingUpsertBrokerState = metadataSnapshot.aliveBrokers.get(upsertBrokerId)
+      val putBrokerRecord = existingUpsertBrokerState.isEmpty || different(brokerRecord, existingUpsertBrokerState.get)
+      if (!putBrokerRecord) {
+        return // it's a no-op
+      }
+      // allocate new alive brokers/nodes
+      val newAliveBrokers = new mutable.LongMap[Broker](metadataSnapshot.aliveBrokers.size + (if (existingUpsertBrokerState.isEmpty) 1 else 0))
+      val newAliveNodes = new mutable.LongMap[collection.Map[ListenerName, Node]](metadataSnapshot.aliveNodes.size + (if (existingUpsertBrokerState.isEmpty) 1 else 0))
+      // insert references to existing alive brokers/nodes for ones that don't correspond to the upserted broker
+      for ((existingBrokerId, existingBroker) <- metadataSnapshot.aliveBrokers) {
+        if (existingBrokerId != upsertBrokerId) {
+          newAliveBrokers(existingBrokerId) = existingBroker
+        }
+      }
+      for ((existingBrokerId, existingListenerNameToNodeMap) <- metadataSnapshot.aliveNodes) {
+        if (existingBrokerId != upsertBrokerId) {
+          newAliveNodes(existingBrokerId) = existingListenerNameToNodeMap
+        }
+      }
+      // add new alive broker/nodes for the upserted broker
+      val nodes = new java.util.HashMap[ListenerName, Node]
+      val endPoints = new mutable.ArrayBuffer[EndPoint]
+      brokerRecord.endPoints().forEach { ep =>
+        val listenerName = new ListenerName(ep.name())
+        endPoints += new EndPoint(ep.host, ep.port, listenerName, SecurityProtocol.forId(ep.securityProtocol))
+        nodes.put(listenerName, new Node(upsertBrokerId, ep.host, ep.port))
+      }
+      newAliveBrokers(upsertBrokerId) = Broker(upsertBrokerId, endPoints, Option(brokerRecord.rack))
+      newAliveNodes(upsertBrokerId) = nodes.asScala
+      logListenersNotIdenticalIfNecessary(newAliveNodes)
+
+      metadataSnapshot = MetadataSnapshot(metadataSnapshot.partitionStates, metadataSnapshot.controllerId, newAliveBrokers, newAliveNodes)
     }
   }
 

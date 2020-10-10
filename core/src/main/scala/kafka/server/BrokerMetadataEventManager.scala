@@ -6,13 +6,8 @@ import kafka.coordinator.group.GroupCoordinator
 import kafka.metrics.KafkaMetricsGroup
 import kafka.server.QuotaFactory.QuotaManagers
 import kafka.utils.ShutdownableThread
-import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.internals.FatalExitError
-import org.apache.kafka.common.message.UpdateMetadataRequestData
 import org.apache.kafka.common.metadata.{AccessControlRecord, BrokerRecord, ConfigRecord, IsrChangeRecord, PartitionRecord, TopicRecord}
-import org.apache.kafka.common.network.ListenerName
-import org.apache.kafka.common.protocol.{ApiKeys, ApiMessage}
-import org.apache.kafka.common.requests.UpdateMetadataRequest
 import org.apache.kafka.common.utils.Time
 import org.apache.kafka.raft.RaftMessage
 
@@ -29,7 +24,7 @@ final case class MetadataEvent(metadataMessage: RaftMessage) extends Event
 /*
  * ShutdownEvent is necessary for the case when the event thread is blocked in queue.take() -- this event wakes it up.
  * Otherwise, this event has no other semantic meaning, it is not guaranteed to be seen by the processing thread,
- * amd it cannot be relied upon to initiate any other functionality; it exists solely for the wakeup case mentioned.
+ * and it cannot be relied upon to initiate any other functionality; it exists solely for the wakeup case mentioned.
  */
 final case object ShutdownEvent extends Event
 
@@ -131,7 +126,7 @@ class BrokerMetadataEventManager(replicaManager: ReplicaManager,
   }
 
   private def handleBrokerRecord(brokerRecord: BrokerRecord): Unit = {
-    throw new UnsupportedOperationException(s"Unimplemented: $brokerRecord") // TODO: implement-me
+    replicaManager.maybeUpdateMetadataCache(brokerRecord)
   }
 
 //  private def handleFenceBrokerRecord(fenceBrokerRecord: FenceBrokerRecord): Unit = {

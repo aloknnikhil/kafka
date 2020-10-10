@@ -44,6 +44,7 @@ import org.apache.kafka.common.message.DeleteRecordsResponseData.DeleteRecordsPa
 import org.apache.kafka.common.message.{DescribeLogDirsResponseData, FetchResponseData, LeaderAndIsrResponseData}
 import org.apache.kafka.common.message.LeaderAndIsrResponseData.LeaderAndIsrPartitionError
 import org.apache.kafka.common.message.StopReplicaRequestData.StopReplicaPartitionState
+import org.apache.kafka.common.metadata.BrokerRecord
 import org.apache.kafka.common.metrics.Metrics
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.protocol.Errors
@@ -1289,6 +1290,14 @@ class ReplicaManager(val config: KafkaConfig,
         deletedPartitions
       }
     }
+  }
+
+  def maybeUpdateMetadataCache(brokerRecord: BrokerRecord) : Unit =  {
+    // I wonder if this synchronization point might no longer be necessary in KIP-500 mode
+    // since we will process metadata events in a single thread at that point.
+    replicaStateChangeLock synchronized {
+        metadataCache.updateMetadata(brokerRecord)
+      }
   }
 
   def becomeLeaderOrFollower(correlationId: Int,
