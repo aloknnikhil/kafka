@@ -114,10 +114,10 @@ class BrokerMetadataEventManager(replicaManager: ReplicaManager,
         case configRecord: ConfigRecord => handleConfigRecord(configRecord)
         case isrChangeRecord: IsrChangeRecord => handleIsrChangeRecord(isrChangeRecord)
         case accessControlRecord: AccessControlRecord => handleAccessControlRecord(accessControlRecord)
-        case _ => handleUnexpected(metadataMessage)
 //        case delegationTokenRecord: DelegationTokenRecord => handleDelegationTokenRecord(delegationTokenRecord)
 //        case scramRecord: ScramRecord => handleScramRecord(scramRecord)
 //        case featureLevelRecord: FeatureLevelRecord => handleFeatureLevelRecord(featureLevelRecord)
+        case _ => handleUnexpected(metadataMessage)
       }
     } catch {
       case e: FatalExitError => throw e
