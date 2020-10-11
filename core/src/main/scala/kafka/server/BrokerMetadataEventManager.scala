@@ -17,6 +17,7 @@
 
 package kafka.server
 
+import java.util
 import java.util.concurrent.{LinkedBlockingQueue, TimeUnit}
 
 import kafka.cluster.{Broker, EndPoint}
@@ -33,6 +34,7 @@ import org.apache.kafka.common.utils.Time
 import org.apache.kafka.raft.RaftMessage
 
 import scala.collection.mutable
+import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters._
 
 object BrokerMetadataEventManager {
@@ -156,8 +158,18 @@ class BrokerMetadataEventManager(config: KafkaConfig,
     /*
     * Upsert the single given broker
     */
-    val basis = new BrokerMetadataBasis(metadataCache)
-    val metadataSnapshot = basis.getMetadataSnapshot()
+    val initialBasis = new MetadataCacheBasis(metadataCache)
+    val resultBasis: WriteableBasis[MetadataSnapshot] = applyToBasis(initialBasis, brokerRecord)
+    resultBasis.writeIfNecessary()
+  }
+
+//  private def handleFenceBrokerRecord(fenceBrokerRecord: FenceBrokerRecord): Unit = {
+//    throw new UnsupportedOperationException(s"Unimplemented: $fenceBrokerRecord") // TODO: implement-me
+//  }
+
+  // TODO: externalize this to make it easier to test
+  private def applyToBasis(basis: MetadataCacheBasis, brokerRecord: BrokerRecord): WriteableBasis[MetadataSnapshot] = {
+    val metadataSnapshot = basis.getValue()
     val upsertBrokerId = brokerRecord.brokerId()
     val existingUpsertBrokerState = metadataSnapshot.aliveBrokers.get(upsertBrokerId)
     // allocate new alive brokers/nodes
@@ -175,8 +187,8 @@ class BrokerMetadataEventManager(config: KafkaConfig,
       }
     }
     // add new alive broker/nodes for the upserted broker
-    val nodes = new java.util.HashMap[ListenerName, Node]
-    val endPoints = new mutable.ArrayBuffer[EndPoint]
+    val nodes = new util.HashMap[ListenerName, Node]
+    val endPoints = new ArrayBuffer[EndPoint]
     brokerRecord.endPoints().forEach { ep =>
       val listenerName = new ListenerName(ep.name())
       endPoints += new EndPoint(ep.host, ep.port, listenerName, SecurityProtocol.forId(ep.securityProtocol))
@@ -186,14 +198,10 @@ class BrokerMetadataEventManager(config: KafkaConfig,
     newAliveNodes(upsertBrokerId) = nodes.asScala
     metadataCache.logListenersNotIdenticalIfNecessary(newAliveNodes)
 
-    basis.setMetadataSnapshot(
+    val nextBasis = basis.newBasis(
       MetadataSnapshot(metadataSnapshot.partitionStates, metadataSnapshot.controllerId, newAliveBrokers, newAliveNodes))
-    basis.writeState()
+    nextBasis
   }
-
-//  private def handleFenceBrokerRecord(fenceBrokerRecord: FenceBrokerRecord): Unit = {
-//    throw new UnsupportedOperationException(s"Unimplemented: $fenceBrokerRecord") // TODO: implement-me
-//  }
 
   private def handleTopicRecord(topicRecord: TopicRecord): Unit = {
     throw new UnsupportedOperationException(s"Unimplemented: $topicRecord") // TODO: implement-me
