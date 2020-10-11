@@ -12,7 +12,8 @@ import org.apache.kafka.common.utils.Time
 import org.apache.kafka.raft.RaftMessage
 
 object BrokerMetadataEventManager {
-  val BrokerMetadataEventThreadName = "broker-metadata-event-thread"
+  val BrokerMetadataEventThreadNamePrefix = "broker-"
+  val BrokerMetadataEventThreadNameSuffix = "-metadata-event-thread"
   val EventQueueTimeMetricName = "EventQueueTimeMs"
   val EventQueueSizeMetricName = "EventQueueSize"
 }
@@ -40,7 +41,8 @@ trait MetadataEventProcessor {
   // note the absence of processShutdown(); see ShutdownEvent above for why it does not exist.
 }
 
-class BrokerMetadataEventManager(replicaManager: ReplicaManager,
+class BrokerMetadataEventManager(config: KafkaConfig,
+                                 replicaManager: ReplicaManager,
                                  groupCoordinator: GroupCoordinator,
                                  metadataCache: MetadataCache,
                                  quotas: QuotaManagers,
@@ -53,7 +55,8 @@ class BrokerMetadataEventManager(replicaManager: ReplicaManager,
 
   val queue = new LinkedBlockingQueue[QueuedEvent]
 
-  val thread = new BrokerMetadataEventThread(BrokerMetadataEventThreadName)
+  val thread = new BrokerMetadataEventThread(
+    s"$BrokerMetadataEventThreadNamePrefix${config.brokerId}$BrokerMetadataEventThreadNameSuffix")
 
   val processor: MetadataEventProcessor = overrideProcessor.getOrElse(this)
 
@@ -126,7 +129,7 @@ class BrokerMetadataEventManager(replicaManager: ReplicaManager,
   }
 
   private def handleBrokerRecord(brokerRecord: BrokerRecord): Unit = {
-    replicaManager.maybeUpdateMetadataCache(brokerRecord)
+    replicaManager.updateMetadataCache(brokerRecord)
   }
 
 //  private def handleFenceBrokerRecord(fenceBrokerRecord: FenceBrokerRecord): Unit = {

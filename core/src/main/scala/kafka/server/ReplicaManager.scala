@@ -1292,7 +1292,7 @@ class ReplicaManager(val config: KafkaConfig,
     }
   }
 
-  def maybeUpdateMetadataCache(brokerRecord: BrokerRecord) : Unit =  {
+  def updateMetadataCache(brokerRecord: BrokerRecord) : Unit =  {
     // I wonder if this synchronization point might no longer be necessary in KIP-500 mode
     // since we will process metadata events in a single thread at that point.
     replicaStateChangeLock synchronized {

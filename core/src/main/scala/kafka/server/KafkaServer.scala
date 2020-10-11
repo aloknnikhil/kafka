@@ -329,7 +329,7 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         groupCoordinator = GroupCoordinator(config, zkClient, replicaManager, Time.SYSTEM, metrics)
         groupCoordinator.startup()
 
-        metadataEventManager = new BrokerMetadataEventManager(replicaManager, groupCoordinator, metadataCache, quotaManagers, clusterId, time)
+        metadataEventManager = new BrokerMetadataEventManager(config, replicaManager, groupCoordinator, metadataCache, quotaManagers, clusterId, time)
 
         /* start transaction coordinator, with a separate background thread scheduler for transaction expiration and log loading */
         // Hardcode Time.SYSTEM for now as some Streams tests fail otherwise, it would be good to fix the underlying issue

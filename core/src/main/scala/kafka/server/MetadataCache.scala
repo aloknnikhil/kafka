@@ -361,46 +361,13 @@ class MetadataCache(brokerId: Int) extends Logging {
     }
   }
 
-  private def different(brokerRecord: BrokerRecord, broker: Broker): Boolean = {
-    if (brokerRecord.brokerId() != broker.id) {
-      return true
-    }
-    val brokerRecordRack = brokerRecord.rack()
-    // not sure if "" may imply no rack since BrokerRecord default constructor sets this.rack=""
-    val brokerRecordHasRack = brokerRecordRack != null && brokerRecordRack != ""
-    if (!brokerRecordHasRack && broker.rack.isDefined || brokerRecordHasRack && broker.rack.isEmpty) {
-      return true
-    }
-    broker.rack.foreach( rack => if (rack != brokerRecordRack) return true)
-    // We are going to have to compare sizes no matter what, so do that first even if this Seq implementation is O(n)
-    if (broker.endPoints.size != brokerRecord.endPoints().size()) {
-      return true
-    }
-    broker.endPoints.foreach(brokerEndPoint => {
-      val brokerRecordEndpoint = brokerRecord.endPoints().find(brokerEndPoint.listenerName.value())
-      if (brokerRecordEndpoint == null) {
-        return true
-      }
-      if (brokerEndPoint.host != brokerRecordEndpoint.host() ||
-        brokerEndPoint.port != brokerRecordEndpoint.port() ||
-        brokerEndPoint.securityProtocol.id != brokerRecordEndpoint.securityProtocol()) {
-        return true
-      }
-    })
-    false
-  }
-
   def updateMetadata(brokerRecord: BrokerRecord): Unit = {
     inWriteLock(partitionMetadataLock) {
       /*
-      * Upsert the single given broker while doing nothing if there is no change
+      * Upsert the single given broker
       */
       val upsertBrokerId = brokerRecord.brokerId()
       val existingUpsertBrokerState = metadataSnapshot.aliveBrokers.get(upsertBrokerId)
-      val putBrokerRecord = existingUpsertBrokerState.isEmpty || different(brokerRecord, existingUpsertBrokerState.get)
-      if (!putBrokerRecord) {
-        return // it's a no-op
-      }
       // allocate new alive brokers/nodes
       val newAliveBrokers = new mutable.LongMap[Broker](metadataSnapshot.aliveBrokers.size + (if (existingUpsertBrokerState.isEmpty) 1 else 0))
       val newAliveNodes = new mutable.LongMap[collection.Map[ListenerName, Node]](metadataSnapshot.aliveNodes.size + (if (existingUpsertBrokerState.isEmpty) 1 else 0))
