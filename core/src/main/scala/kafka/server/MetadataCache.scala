@@ -34,7 +34,6 @@ import org.apache.kafka.common.message.UpdateMetadataRequestData.UpdateMetadataP
 import org.apache.kafka.common.{Cluster, Node, PartitionInfo, TopicPartition}
 import org.apache.kafka.common.message.MetadataResponseData.MetadataResponseTopic
 import org.apache.kafka.common.message.MetadataResponseData.MetadataResponsePartition
-import org.apache.kafka.common.metadata.BrokerRecord
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.requests.{MetadataResponse, UpdateMetadataRequest}
@@ -353,7 +352,7 @@ class MetadataCache(brokerId: Int) extends Logging {
     }
   }
 
-  private def logListenersNotIdenticalIfNecessary(aliveNodes: mutable.LongMap[collection.Map[ListenerName, Node]]) = {
+  def logListenersNotIdenticalIfNecessary(aliveNodes: mutable.LongMap[collection.Map[ListenerName, Node]]) = {
     aliveNodes.get(brokerId).foreach { listenerMap =>
       val listeners = listenerMap.keySet
       if (!aliveNodes.values.forall(_.keySet == listeners))
@@ -361,40 +360,14 @@ class MetadataCache(brokerId: Int) extends Logging {
     }
   }
 
-  def updateMetadata(brokerRecord: BrokerRecord): Unit = {
-    inWriteLock(partitionMetadataLock) {
-      /*
-      * Upsert the single given broker
-      */
-      val upsertBrokerId = brokerRecord.brokerId()
-      val existingUpsertBrokerState = metadataSnapshot.aliveBrokers.get(upsertBrokerId)
-      // allocate new alive brokers/nodes
-      val newAliveBrokers = new mutable.LongMap[Broker](metadataSnapshot.aliveBrokers.size + (if (existingUpsertBrokerState.isEmpty) 1 else 0))
-      val newAliveNodes = new mutable.LongMap[collection.Map[ListenerName, Node]](metadataSnapshot.aliveNodes.size + (if (existingUpsertBrokerState.isEmpty) 1 else 0))
-      // insert references to existing alive brokers/nodes for ones that don't correspond to the upserted broker
-      for ((existingBrokerId, existingBroker) <- metadataSnapshot.aliveBrokers) {
-        if (existingBrokerId != upsertBrokerId) {
-          newAliveBrokers(existingBrokerId) = existingBroker
-        }
-      }
-      for ((existingBrokerId, existingListenerNameToNodeMap) <- metadataSnapshot.aliveNodes) {
-        if (existingBrokerId != upsertBrokerId) {
-          newAliveNodes(existingBrokerId) = existingListenerNameToNodeMap
-        }
-      }
-      // add new alive broker/nodes for the upserted broker
-      val nodes = new java.util.HashMap[ListenerName, Node]
-      val endPoints = new mutable.ArrayBuffer[EndPoint]
-      brokerRecord.endPoints().forEach { ep =>
-        val listenerName = new ListenerName(ep.name())
-        endPoints += new EndPoint(ep.host, ep.port, listenerName, SecurityProtocol.forId(ep.securityProtocol))
-        nodes.put(listenerName, new Node(upsertBrokerId, ep.host, ep.port))
-      }
-      newAliveBrokers(upsertBrokerId) = Broker(upsertBrokerId, endPoints, Option(brokerRecord.rack))
-      newAliveNodes(upsertBrokerId) = nodes.asScala
-      logListenersNotIdenticalIfNecessary(newAliveNodes)
+  def getMetadataSnapshot(): MetadataSnapshot = {
+    val retval = metadataSnapshot
+    retval
+  }
 
-      metadataSnapshot = MetadataSnapshot(metadataSnapshot.partitionStates, metadataSnapshot.controllerId, newAliveBrokers, newAliveNodes)
+  def setMetadataSnapshot(metadataSnapshot: MetadataSnapshot) = {
+    inWriteLock(partitionMetadataLock) {
+      this.metadataSnapshot = metadataSnapshot
     }
   }
 
@@ -412,10 +385,9 @@ class MetadataCache(brokerId: Int) extends Logging {
       true
     }
   }
-
-  case class MetadataSnapshot(partitionStates: mutable.AnyRefMap[String, mutable.LongMap[UpdateMetadataPartitionState]],
-                              controllerId: Option[Int],
-                              aliveBrokers: mutable.LongMap[Broker],
-                              aliveNodes: mutable.LongMap[collection.Map[ListenerName, Node]])
-
 }
+
+case class MetadataSnapshot(partitionStates: mutable.AnyRefMap[String, mutable.LongMap[UpdateMetadataPartitionState]],
+                            controllerId: Option[Int],
+                            aliveBrokers: mutable.LongMap[Broker],
+                            aliveNodes: mutable.LongMap[collection.Map[ListenerName, Node]])

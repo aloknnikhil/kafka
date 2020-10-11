@@ -19,14 +19,21 @@ package kafka.server
 
 import java.util.concurrent.{LinkedBlockingQueue, TimeUnit}
 
+import kafka.cluster.{Broker, EndPoint}
 import kafka.coordinator.group.GroupCoordinator
 import kafka.metrics.KafkaMetricsGroup
 import kafka.server.QuotaFactory.QuotaManagers
 import kafka.utils.ShutdownableThread
+import org.apache.kafka.common.Node
 import org.apache.kafka.common.internals.FatalExitError
 import org.apache.kafka.common.metadata.{AccessControlRecord, BrokerRecord, ConfigRecord, IsrChangeRecord, PartitionRecord, TopicRecord}
+import org.apache.kafka.common.network.ListenerName
+import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.apache.kafka.common.utils.Time
 import org.apache.kafka.raft.RaftMessage
+
+import scala.collection.mutable
+import scala.jdk.CollectionConverters._
 
 object BrokerMetadataEventManager {
   val BrokerMetadataEventThreadNamePrefix = "broker-"
@@ -146,7 +153,42 @@ class BrokerMetadataEventManager(config: KafkaConfig,
   }
 
   private def handleBrokerRecord(brokerRecord: BrokerRecord): Unit = {
-    replicaManager.updateMetadataCache(brokerRecord)
+    /*
+    * Upsert the single given broker
+    */
+    val basis = new BrokerMetadataBasis(metadataCache)
+    val metadataSnapshot = basis.getMetadataSnapshot()
+    val upsertBrokerId = brokerRecord.brokerId()
+    val existingUpsertBrokerState = metadataSnapshot.aliveBrokers.get(upsertBrokerId)
+    // allocate new alive brokers/nodes
+    val newAliveBrokers = new mutable.LongMap[Broker](metadataSnapshot.aliveBrokers.size + (if (existingUpsertBrokerState.isEmpty) 1 else 0))
+    val newAliveNodes = new mutable.LongMap[collection.Map[ListenerName, Node]](metadataSnapshot.aliveNodes.size + (if (existingUpsertBrokerState.isEmpty) 1 else 0))
+    // insert references to existing alive brokers/nodes for ones that don't correspond to the upserted broker
+    for ((existingBrokerId, existingBroker) <- metadataSnapshot.aliveBrokers) {
+      if (existingBrokerId != upsertBrokerId) {
+        newAliveBrokers(existingBrokerId) = existingBroker
+      }
+    }
+    for ((existingBrokerId, existingListenerNameToNodeMap) <- metadataSnapshot.aliveNodes) {
+      if (existingBrokerId != upsertBrokerId) {
+        newAliveNodes(existingBrokerId) = existingListenerNameToNodeMap
+      }
+    }
+    // add new alive broker/nodes for the upserted broker
+    val nodes = new java.util.HashMap[ListenerName, Node]
+    val endPoints = new mutable.ArrayBuffer[EndPoint]
+    brokerRecord.endPoints().forEach { ep =>
+      val listenerName = new ListenerName(ep.name())
+      endPoints += new EndPoint(ep.host, ep.port, listenerName, SecurityProtocol.forId(ep.securityProtocol))
+      nodes.put(listenerName, new Node(upsertBrokerId, ep.host, ep.port))
+    }
+    newAliveBrokers(upsertBrokerId) = Broker(upsertBrokerId, endPoints, Option(brokerRecord.rack))
+    newAliveNodes(upsertBrokerId) = nodes.asScala
+    metadataCache.logListenersNotIdenticalIfNecessary(newAliveNodes)
+
+    basis.setMetadataSnapshot(
+      MetadataSnapshot(metadataSnapshot.partitionStates, metadataSnapshot.controllerId, newAliveBrokers, newAliveNodes))
+    basis.writeState()
   }
 
 //  private def handleFenceBrokerRecord(fenceBrokerRecord: FenceBrokerRecord): Unit = {
