@@ -392,8 +392,10 @@ case class MetadataSnapshot(partitionStates: mutable.AnyRefMap[String, mutable.L
                             aliveBrokers: mutable.LongMap[Broker],
                             aliveNodes: mutable.LongMap[collection.Map[ListenerName, Node]])
 
-//  convenience definition
-class MetadataCacheBasis(metadataCache: MetadataCache,
-                        metadataSnapshot: Option[MetadataSnapshot] = None
-                       ) extends WriteableBasis[MetadataSnapshot](metadataCache, metadataSnapshot) {
+class MetadataCacheBasis(val metadataCache: MetadataCache,
+                         metadataSnapshot: Option[MetadataSnapshot] = None
+                        ) extends WriteableBasis[MetadataSnapshot](metadataCache, metadataSnapshot) {
+  override def newBasis(valueToWrite: MetadataSnapshot): MetadataCacheBasis = {
+    super.newBasis(valueToWrite).asInstanceOf[MetadataCacheBasis]
+  }
 }

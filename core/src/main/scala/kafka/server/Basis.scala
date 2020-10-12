@@ -53,7 +53,7 @@ trait Basis[T] {
 class LiteralBasis[T](value: T) extends Basis[T] {
   override def getValue(): T = value
 
-  override def newBasis(value: T): Basis[T] = new LiteralBasis(value)
+  override def newBasis(value: T): LiteralBasis[T] = new LiteralBasis(value)
 
   override def writeIfNecessary(): Unit = {}
 }

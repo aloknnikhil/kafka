@@ -35,9 +35,10 @@ import kafka.network.SocketServer
 import kafka.security.CredentialProvider
 import kafka.utils._
 import kafka.zk.{BrokerInfo, KafkaZkClient}
-import org.apache.kafka.clients.{ApiVersions, ClientDnsLookup, ManualMetadataUpdater, NetworkClient, NetworkClientUtils, CommonClientConfigs}
+import org.apache.kafka.clients.{ApiVersions, ClientDnsLookup, CommonClientConfigs, ManualMetadataUpdater, NetworkClient, NetworkClientUtils}
 import org.apache.kafka.common.internals.ClusterResourceListeners
 import org.apache.kafka.common.message.ControlledShutdownRequestData
+import org.apache.kafka.common.metadata.MetadataRecordType
 import org.apache.kafka.common.metrics.{JmxReporter, Metrics, MetricsReporter, _}
 import org.apache.kafka.common.network._
 import org.apache.kafka.common.protocol.Errors
@@ -329,7 +330,16 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         groupCoordinator = GroupCoordinator(config, zkClient, replicaManager, Time.SYSTEM, metrics)
         groupCoordinator.startup()
 
-        metadataEventManager = new BrokerMetadataEventManager(config, replicaManager, groupCoordinator, metadataCache, quotaManagers, clusterId, time)
+        val processors = new util.EnumMap[MetadataRecordType, ApiMessageProcessor](classOf[MetadataRecordType])
+
+        // TODO: don't fill in incorrect processors once all types are implemented
+        MetadataRecordType.values().foreach(v => processors.put(v, new BrokerRecordProcessor))
+
+        processors.put(MetadataRecordType.BROKER_RECORD, new BrokerRecordProcessor)
+        // add more here as we implement them
+
+        metadataEventManager = new BrokerMetadataEventManager(config,
+          new BrokerMetadataBasis(metadataCache), time, processors)
 
         /* start transaction coordinator, with a separate background thread scheduler for transaction expiration and log loading */
         // Hardcode Time.SYSTEM for now as some Streams tests fail otherwise, it would be good to fix the underlying issue
