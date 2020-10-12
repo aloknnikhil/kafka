@@ -70,7 +70,10 @@ class BrokerMetadataEventManager(config: KafkaConfig,
 
   import BrokerMetadataEventManager._
 
-  val queue = new LinkedBlockingQueue[QueuedEvent]
+  val blockingQueue = new LinkedBlockingQueue[QueuedEvent]
+  val bufferQueue: util.Queue[QueuedEvent] = new util.ArrayDeque[QueuedEvent]
+  // we need buffer queue size for a metric read in a separate thread, so keep the size in a thread-safe way
+  @volatile var bufferQueueSize: Int = 0
 
   val thread = new BrokerMetadataEventThread(
     s"$BrokerMetadataEventThreadNamePrefix${config.brokerId}$BrokerMetadataEventThreadNameSuffix")
@@ -79,7 +82,7 @@ class BrokerMetadataEventManager(config: KafkaConfig,
 
   // metrics
   private val eventQueueTimeHist = newHistogram(EventQueueTimeMetricName)
-  newGauge(EventQueueSizeMetricName, () => queue.size)
+  newGauge(EventQueueSizeMetricName, () => blockingQueue.size + bufferQueueSize)
 
   def start(): Unit = {
     put(StartupEvent)
@@ -99,22 +102,35 @@ class BrokerMetadataEventManager(config: KafkaConfig,
 
   def put(event: Event): QueuedEvent = {
     val queuedEvent = new QueuedEvent(event, time.milliseconds())
-    queue.put(queuedEvent)
+    blockingQueue.put(queuedEvent)
     queuedEvent
   }
 
   private def pollFromEventQueue(): QueuedEvent = {
+    val bufferedEvent = bufferQueue.poll()
+    if (bufferedEvent != null) {
+      bufferQueueSize -= 1
+      return bufferedEvent
+    }
+    val numBuffered = blockingQueue.drainTo(bufferQueue)
+    if (numBuffered != 0) {
+      // it's already 0, so don't write 0 again
+      if (numBuffered != 1) {
+        bufferQueueSize = numBuffered - 1
+      }
+      return bufferQueue.poll()
+    }
     val hasRecordedValue = eventQueueTimeHist.count() > 0
     if (hasRecordedValue) {
-      val event = queue.poll(eventQueueTimeTimeoutMs, TimeUnit.MILLISECONDS)
+      val event = blockingQueue.poll(eventQueueTimeTimeoutMs, TimeUnit.MILLISECONDS)
       if (event == null) {
         eventQueueTimeHist.clear()
-        queue.take()
+        blockingQueue.take()
       } else {
         event
       }
     } else {
-      queue.take()
+      blockingQueue.take()
     }
   }
 
@@ -126,7 +142,7 @@ class BrokerMetadataEventManager(config: KafkaConfig,
       trace(s"Handling metadata message: $metadataMessage")
       val data = metadataMessage.data
       val processor = processors.get(MetadataRecordType.values()(data.apiKey()))
-      currentBasis = processor.applyTo(currentBasis, data)
+      currentBasis = processor.process(currentBasis, data)
       currentBasis.writeIfNecessary()
     } catch {
       case e: FatalExitError => throw e

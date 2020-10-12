@@ -47,6 +47,6 @@ class BrokerMetadataBasis(metadataCache: MetadataCache)
  * Ability to apply an ApiMessage on top of an existing broker metadata basis
  */
 trait ApiMessageProcessor {
-  def applyTo(brokerMetadataBasis: BrokerMetadataBasis, apiMessage: ApiMessage): BrokerMetadataBasis
+  def process(brokerMetadataBasis: BrokerMetadataBasis, apiMessage: ApiMessage): BrokerMetadataBasis
 }
 

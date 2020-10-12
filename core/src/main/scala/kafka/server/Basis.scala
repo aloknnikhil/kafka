@@ -45,20 +45,6 @@ trait Basis[T] {
 }
 
 /**
- * A literal value that doesn't need to be written anywhere (useful for testing)
- *
- * @param value the value
- * @tparam T the value type
- */
-class LiteralBasis[T](value: T) extends Basis[T] {
-  override def getValue(): T = value
-
-  override def newBasis(value: T): LiteralBasis[T] = new LiteralBasis(value)
-
-  override def writeIfNecessary(): Unit = {}
-}
-
-/**
  * The ability to retrieve or write a value
  *
  * @tparam T the value type
