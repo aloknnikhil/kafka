@@ -54,6 +54,7 @@ class QueuedEvent(val event: Event, val enqueueTimeMs: Long) {
 trait MetadataEventProcessor {
   def processStartup(): Unit
   def process(metadataMessage: RaftMessage): Unit
+  def commitCurrentBasis() : Unit
   // note the absence of processShutdown(); see ShutdownEvent above for why it does not exist.
 }
 
@@ -106,34 +107,6 @@ class BrokerMetadataEventManager(config: KafkaConfig,
     queuedEvent
   }
 
-  private def pollFromEventQueue(): QueuedEvent = {
-    val bufferedEvent = bufferQueue.poll()
-    if (bufferedEvent != null) {
-      bufferQueueSize -= 1
-      return bufferedEvent
-    }
-    val numBuffered = blockingQueue.drainTo(bufferQueue)
-    if (numBuffered != 0) {
-      // it's already 0, so don't write 0 again
-      if (numBuffered != 1) {
-        bufferQueueSize = numBuffered - 1
-      }
-      return bufferQueue.poll()
-    }
-    val hasRecordedValue = eventQueueTimeHist.count() > 0
-    if (hasRecordedValue) {
-      val event = blockingQueue.poll(eventQueueTimeTimeoutMs, TimeUnit.MILLISECONDS)
-      if (event == null) {
-        eventQueueTimeHist.clear()
-        blockingQueue.take()
-      } else {
-        event
-      }
-    } else {
-      blockingQueue.take()
-    }
-  }
-
   override def processStartup(): Unit = {
   }
 
@@ -143,11 +116,14 @@ class BrokerMetadataEventManager(config: KafkaConfig,
       val data = metadataMessage.data
       val processor = processors.get(MetadataRecordType.values()(data.apiKey()))
       currentBasis = processor.process(currentBasis, data)
-      currentBasis.writeIfNecessary()
     } catch {
       case e: FatalExitError => throw e
       case e: Exception => handleError(metadataMessage, e)
     }
+  }
+
+  override def commitCurrentBasis(): Unit = {
+    currentBasis.writeIfNecessary()
   }
 
   def handleError(metadataMessage: RaftMessage, e: Exception): Unit = {
@@ -165,10 +141,39 @@ class BrokerMetadataEventManager(config: KafkaConfig,
           eventQueueTimeHist.update(time.milliseconds() - dequeued.enqueueTimeMs)
           try {
             process(metadataEvent.metadataMessage)
+            commitCurrentBasis() // for now, every message is committed and we expose all state changes
           } catch {
             case e: Throwable => error(s"Uncaught error processing event: $metadataEvent", e)
           }
         case ShutdownEvent => // Ignore since it serves solely to wake us up and we weren't guaranteed to see it
+      }
+    }
+
+    private def pollFromEventQueue(): QueuedEvent = {
+      val bufferedEvent = bufferQueue.poll()
+      if (bufferedEvent != null) {
+        bufferQueueSize -= 1
+        return bufferedEvent
+      }
+      val numBuffered = blockingQueue.drainTo(bufferQueue)
+      if (numBuffered != 0) {
+        // it's already 0, so don't write 0 again
+        if (numBuffered != 1) {
+          bufferQueueSize = numBuffered - 1
+        }
+        return bufferQueue.poll()
+      }
+      val hasRecordedValue = eventQueueTimeHist.count() > 0
+      if (hasRecordedValue) {
+        val event = blockingQueue.poll(eventQueueTimeTimeoutMs, TimeUnit.MILLISECONDS)
+        if (event == null) {
+          eventQueueTimeHist.clear()
+          blockingQueue.take()
+        } else {
+          event
+        }
+      } else {
+        blockingQueue.take()
       }
     }
   }
