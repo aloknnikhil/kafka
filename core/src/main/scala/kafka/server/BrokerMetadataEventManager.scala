@@ -24,8 +24,8 @@ import kafka.metrics.KafkaMetricsGroup
 import kafka.utils.ShutdownableThread
 import org.apache.kafka.common.internals.FatalExitError
 import org.apache.kafka.common.metadata.MetadataRecordType
+import org.apache.kafka.common.protocol.ApiMessage
 import org.apache.kafka.common.utils.Time
-import org.apache.kafka.raft.RaftMessage
 
 object BrokerMetadataEventManager {
   val BrokerMetadataEventThreadNamePrefix = "broker-"
@@ -37,7 +37,7 @@ object BrokerMetadataEventManager {
 sealed trait Event {}
 
 final case object StartupEvent extends Event
-final case class MetadataEvent(metadataMessage: RaftMessage) extends Event
+final case class MetadataEvent(apiMessages: List[ApiMessage]) extends Event
 /*
  * ShutdownEvent is necessary for the case when the event thread is blocked in queue.take() -- this event wakes it up.
  * Otherwise, this event has no other semantic meaning, it is not guaranteed to be seen by the processing thread,
@@ -53,8 +53,7 @@ class QueuedEvent(val event: Event, val enqueueTimeMs: Long) {
 
 trait MetadataEventProcessor {
   def processStartup(): Unit
-  def process(metadataMessage: RaftMessage): Unit
-  def commitCurrentBasis() : Unit
+  def process(apiMessages: List[ApiMessage]): Unit
   // note the absence of processShutdown(); see ShutdownEvent above for why it does not exist.
 }
 
@@ -110,24 +109,25 @@ class BrokerMetadataEventManager(config: KafkaConfig,
   override def processStartup(): Unit = {
   }
 
-  override def process(metadataMessage: RaftMessage): Unit = {
+  override def process(apiMessages: List[ApiMessage]): Unit = {
     try {
-      trace(s"Handling metadata message: $metadataMessage")
-      val data = metadataMessage.data
-      val processor = processors.get(MetadataRecordType.values()(data.apiKey()))
-      currentBasis = processor.process(currentBasis, data)
+      trace(s"Handling metadata messages: $apiMessages")
+      var basis = currentBasis
+      apiMessages.foreach(message => {
+        val processor = processors.get(MetadataRecordType.values()(message.apiKey()))
+        basis = processor.process(basis, message)
+      })
+      // only expose the changes at the end -- do not expose intermediate state
+      basis.writeIfNecessary()
+      currentBasis = basis
     } catch {
       case e: FatalExitError => throw e
-      case e: Exception => handleError(metadataMessage, e)
+      case e: Exception => handleError(apiMessages, e)
     }
   }
 
-  override def commitCurrentBasis(): Unit = {
-    currentBasis.writeIfNecessary()
-  }
-
-  def handleError(metadataMessage: RaftMessage, e: Exception): Unit = {
-    error(s"Error when handling metadata message: $metadataMessage", e)
+  def handleError(apiMessages: List[ApiMessage], e: Exception): Unit = {
+    error(s"Error when handling metadata messages: $apiMessages", e)
   }
 
   class BrokerMetadataEventThread(name: String) extends ShutdownableThread(name = name, isInterruptible = false) {
@@ -140,8 +140,7 @@ class BrokerMetadataEventManager(config: KafkaConfig,
         case metadataEvent: MetadataEvent =>
           eventQueueTimeHist.update(time.milliseconds() - dequeued.enqueueTimeMs)
           try {
-            process(metadataEvent.metadataMessage)
-            commitCurrentBasis() // for now, every message is committed and we expose all state changes
+            process(metadataEvent.apiMessages)
           } catch {
             case e: Throwable => error(s"Uncaught error processing event: $metadataEvent", e)
           }

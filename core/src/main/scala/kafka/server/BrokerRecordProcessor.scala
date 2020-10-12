@@ -36,7 +36,7 @@ class BrokerRecordProcessor extends ApiMessageProcessor {
         case brokerRecord: BrokerRecord =>
           val brokerMetadataValue = brokerMetadataBasis.getValue()
 
-          val newMetadataCacheBasis: MetadataCacheBasis = applyTo(brokerRecord, brokerMetadataValue.metadataCacheBasis)
+          val newMetadataCacheBasis: MetadataCacheBasis = process(brokerRecord, brokerMetadataValue.metadataCacheBasis)
 
           brokerMetadataBasis.newBasis(brokerMetadataValue.newValue(newMetadataCacheBasis))
         case unexpected => throw new IllegalArgumentException(s"apiMessage was not of type BrokerRecord: ${unexpected.getClass}")
@@ -44,7 +44,7 @@ class BrokerRecordProcessor extends ApiMessageProcessor {
   }
 
   // visible for testing
-  private[server] def applyTo(brokerRecord: BrokerRecord, metadataCacheBasis: MetadataCacheBasis) = {
+  private[server] def process(brokerRecord: BrokerRecord, metadataCacheBasis: MetadataCacheBasis) = {
     val metadataSnapshot = metadataCacheBasis.getValue()
     val upsertBrokerId = brokerRecord.brokerId()
     val existingUpsertBrokerState = metadataSnapshot.aliveBrokers.get(upsertBrokerId)

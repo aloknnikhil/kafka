@@ -336,6 +336,7 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         MetadataRecordType.values().foreach(v => processors.put(v, new BrokerRecordProcessor))
 
         processors.put(MetadataRecordType.BROKER_RECORD, new BrokerRecordProcessor)
+        processors.put(MetadataRecordType.TOPIC_RECORD, new TopicRecordProcessor)
         // add more here as we implement them
 
         metadataEventManager = new BrokerMetadataEventManager(config,
