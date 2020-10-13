@@ -1392,3 +1392,33 @@ case class LeaveMemberResponse(memberId: String,
 
 case class LeaveGroupResult(topLevelError: Errors,
                             memberResponses : List[LeaveMemberResponse])
+
+/**
+ * Represents the action telling the group coordinator that partitions have been deleted.  A new action that
+ * encompasses additional deleted partitions can be created via #addPartitionsToDelete(List[TopicPartition]).
+ * The action can be invoked at any time via (idempotent) #groupCoordinatorHandleDeletedPartitionsIfNecessary()
+ *
+ * @param groupCoordinator the group coordinator
+ * @param partitionsToDelete the partitions to delete
+ */
+class GroupCoordinatorPartitionsToDelete(val groupCoordinator: GroupCoordinator,
+                                         partitionsToDelete: List[TopicPartition] = List()) {
+  private var alreadyHandledDeletedPartitions = false
+
+  def addPartitionsToDelete(additionalPartitionsToDelete: List[TopicPartition]): GroupCoordinatorPartitionsToDelete = {
+    if (additionalPartitionsToDelete.isEmpty) {
+      this
+    } else {
+      val currentPartitionsToDeleteNotYetHandled =
+        if (alreadyHandledDeletedPartitions) List() else partitionsToDelete
+      new GroupCoordinatorPartitionsToDelete(groupCoordinator, currentPartitionsToDeleteNotYetHandled ++ additionalPartitionsToDelete)
+    }
+  }
+
+  def groupCoordinatorHandleDeletedPartitionsIfNecessary(): Unit = {
+    if (!alreadyHandledDeletedPartitions && partitionsToDelete.nonEmpty) {
+      groupCoordinator.handleDeletedPartitions(partitionsToDelete)
+      alreadyHandledDeletedPartitions = true
+    }
+  }
+}

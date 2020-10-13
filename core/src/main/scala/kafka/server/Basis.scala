@@ -18,7 +18,9 @@
 package kafka.server
 
 /**
- * A stable basis upon which we can act to create a new basis and that we can write to some destination
+ * A stable basis upon which we can act to create a new basis and that we can write to some destination.
+ *
+ * This is appropriate to use when it is the only write path to the value.
  *
  * @tparam T the value type
  */
@@ -39,13 +41,15 @@ trait Basis[T] {
   def newBasis(value: T) : Basis[T]
 
   /**
-   * Write the value to its destination if necessary
+   * Write the value to its destination if necessary.  This method is idempotent.
    */
   def writeIfNecessary(): Unit
 }
 
 /**
- * The ability to retrieve or write a value
+ * The ability to retrieve or write a value.
+ *
+ * This is appropriate to use when it is the only write path to the value.
  *
  * @tparam T the value type
  */
@@ -61,6 +65,8 @@ trait ValueHolder[T] {
  * We can act upon this basis to create a new value/basis, and we can write the new value back to the destination
  * on-demand.  It is assumed that writing a value may be expensive (e.g. it may require a lock/synchronization),
  * so each instance keeps track of whether the value needs to be written or not.
+ *
+ * This is appropriate to use when it is the only write path to the value.
  *
  * @param valueHolder the source/destination for the value
  * @param valueToWrite the new value to write

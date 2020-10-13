@@ -340,7 +340,7 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         // add more here as we implement them
 
         metadataEventManager = new BrokerMetadataEventManager(config,
-          new BrokerMetadataBasis(metadataCache), time, processors)
+          new BrokerMetadataBasis(config, clusterId, metadataCache, groupCoordinator, quotaManagers), time, processors)
 
         /* start transaction coordinator, with a separate background thread scheduler for transaction expiration and log loading */
         // Hardcode Time.SYSTEM for now as some Streams tests fail otherwise, it would be good to fix the underlying issue

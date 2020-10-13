@@ -137,3 +137,42 @@ object QuotaFactory extends Logging {
   }
 
 }
+
+/**
+ * Represents the action giving the client quota callback (if any) an opportunity to decide if quota metric configs
+ * need to be updated based on current cluster metadata. A new action that enables this action can be created via
+ * #enableConfigUpdates().  The action (when enabled) can be invoked at any time via (idempotent)
+ * #updateConfigsIfNecessary().
+ *
+ * @param quotaManagers the quota managers
+ * @param updateClientQuotaCallbackMetricConfigs whether to update configs or not
+ */
+class UpdateClientQuotaCallbackMetricConfigs(kafkaConfig: KafkaConfig,
+                                             quotaManagers: QuotaFactory.QuotaManagers,
+                                             metadataCache: MetadataCache,
+                                             clusterId: String,
+                                             updateClientQuotaCallbackMetricConfigs: Boolean = false) {
+  private var alreadyUpdatedConfigs = false
+
+  def enableConfigUpdates(): UpdateClientQuotaCallbackMetricConfigs = {
+    if (updateClientQuotaCallbackMetricConfigs && !alreadyUpdatedConfigs) {
+      this
+    } else {
+      new UpdateClientQuotaCallbackMetricConfigs(kafkaConfig, quotaManagers, metadataCache, clusterId, true)
+    }
+  }
+
+  def updateConfigsIfNecessary(): Unit = {
+    if (!alreadyUpdatedConfigs && updateClientQuotaCallbackMetricConfigs) {
+      quotaManagers.clientQuotaCallback.foreach { callback =>
+        if (callback.updateClusterMetadata(metadataCache.getClusterMetadata(clusterId, kafkaConfig.interBrokerListenerName))) {
+          quotaManagers.fetch.updateQuotaMetricConfigs()
+          quotaManagers.produce.updateQuotaMetricConfigs()
+          quotaManagers.request.updateQuotaMetricConfigs()
+          quotaManagers.controllerMutation.updateQuotaMetricConfigs()
+        }
+      }
+      alreadyUpdatedConfigs = true
+    }
+  }
+}

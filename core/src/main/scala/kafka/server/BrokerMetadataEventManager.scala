@@ -114,7 +114,7 @@ class BrokerMetadataEventManager(config: KafkaConfig,
       trace(s"Handling metadata messages: $apiMessages")
       var basis = currentBasis
       apiMessages.foreach(message => {
-        val processor = processors.get(MetadataRecordType.values()(message.apiKey()))
+        val processor = processors.get(MetadataRecordType.fromId(message.apiKey()))
         basis = processor.process(basis, message)
       })
       // only expose the changes at the end -- do not expose intermediate state
