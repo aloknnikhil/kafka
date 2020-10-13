@@ -68,11 +68,11 @@ class TopicRecordProcessor extends ApiMessageProcessor {
       metadataCache.logStateChangeTrace(s"Will delete ${deletedPartitions.size} partitions from metadata cache in response to TopicRecord in metadata log")
       val newMetadataCacheBasis = metadataCacheBasis.newBasis(
         MetadataSnapshot(partitionStatesCopy, metadataSnapshot.controllerId, metadataSnapshot.aliveBrokers, metadataSnapshot.aliveNodes))
-      val newGroupCoordinatorPartitionsToDelete = brokerMetadataValue.groupCoordinatorPartitionsToDelete.addPartitionsToDelete(deletedPartitions.toList)
+      val newGroupCoordinatorPartitionsDeleted = brokerMetadataValue.groupCoordinatorPartitionsDeleted.addPartitionsDeleted(deletedPartitions.toList)
       val newUpdateClientQuotaCallbackMetricConfigs = brokerMetadataValue.updateClientQuotaCallbackMetricConfigs.enableConfigUpdates()
       brokerMetadataBasis.newBasis(
         brokerMetadataValue.newValue(newMetadataCacheBasis)
-          .newValue(newGroupCoordinatorPartitionsToDelete)
+          .newValue(newGroupCoordinatorPartitionsDeleted)
           .newValue(newUpdateClientQuotaCallbackMetricConfigs))
     }
   }

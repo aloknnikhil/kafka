@@ -17,40 +17,40 @@
 
 package kafka.server
 
-import kafka.coordinator.group.{GroupCoordinator, GroupCoordinatorPartitionsToDelete}
+import kafka.coordinator.group.{GroupCoordinator, GroupCoordinatorPartitionsDeleted}
 import org.apache.kafka.common.protocol.ApiMessage
 
 /**
  * There is no single place where all broker metadata lives.  For example, MetadataCache holds some of it,
- * ReplicaManager holds some of it, etc.  This class is a composite of the pieces from the various locations and
- * stitches them together into a single value.  Each individual piece may itself be a {@link WriteableBasis} when
+ * ReplicaManager holds some of it, etc.  This class is a composite of the pieces from the various locations, and it
+ * stitches the pieces together into a single value.  Each individual piece may be a {@link WriteableBasis} when
  * it is the only write path to that part of the metadata, and such pieces can change independently of each other.
  * The parts of the metadata that are not the only write path are represented by actions that can be applied.
  *
  * @param metadataCacheBasis the MetadataCacheBasis defining part of the value
- * @param groupCoordinatorPartitionsToDelete the action indicating to the group coordinator what partitions (if any)
- *                                           have been deleted
+ * @param groupCoordinatorPartitionsDeleted the action indicating to the group coordinator what partitions (if any)
+ *                                          have been deleted
  * @param updateClientQuotaCallbackMetricConfigs the action giving the client quota callback (if any) an opportunity to
  *                                               decide if quota metric configs need to be updated based on current
  *                                               cluster metadata
  */
 case class BrokerMetadataValue(metadataCacheBasis: MetadataCacheBasis,
-                               groupCoordinatorPartitionsToDelete: GroupCoordinatorPartitionsToDelete,
+                               groupCoordinatorPartitionsDeleted: GroupCoordinatorPartitionsDeleted,
                                updateClientQuotaCallbackMetricConfigs: UpdateClientQuotaCallbackMetricConfigs
                               ) {
   def newValue(metadataCacheBasis: MetadataCacheBasis): BrokerMetadataValue = {
     // keep all parts except the one given
-    BrokerMetadataValue(metadataCacheBasis, groupCoordinatorPartitionsToDelete, updateClientQuotaCallbackMetricConfigs)
+    BrokerMetadataValue(metadataCacheBasis, groupCoordinatorPartitionsDeleted, updateClientQuotaCallbackMetricConfigs)
   }
 
-  def newValue(groupCoordinatorPartitionsToDelete: GroupCoordinatorPartitionsToDelete): BrokerMetadataValue = {
+  def newValue(groupCoordinatorPartitionsDeleted: GroupCoordinatorPartitionsDeleted): BrokerMetadataValue = {
     // keep all parts except the one given
-    BrokerMetadataValue(metadataCacheBasis, groupCoordinatorPartitionsToDelete, updateClientQuotaCallbackMetricConfigs)
+    BrokerMetadataValue(metadataCacheBasis, groupCoordinatorPartitionsDeleted, updateClientQuotaCallbackMetricConfigs)
   }
 
   def newValue(updateClientQuotaCallbackMetricConfigs: UpdateClientQuotaCallbackMetricConfigs): BrokerMetadataValue = {
     // keep all parts except the one given
-    BrokerMetadataValue(metadataCacheBasis, groupCoordinatorPartitionsToDelete, updateClientQuotaCallbackMetricConfigs)
+    BrokerMetadataValue(metadataCacheBasis, groupCoordinatorPartitionsDeleted, updateClientQuotaCallbackMetricConfigs)
   }
 
   /**
@@ -58,7 +58,7 @@ case class BrokerMetadataValue(metadataCacheBasis: MetadataCacheBasis,
    */
   def writeIfNecessary() : Unit = {
     metadataCacheBasis.writeIfNecessary()
-    groupCoordinatorPartitionsToDelete.groupCoordinatorHandleDeletedPartitionsIfNecessary()
+    groupCoordinatorPartitionsDeleted.groupCoordinatorHandlePartitionsDeletedIfNecessary()
   }
 }
 
@@ -66,7 +66,7 @@ case class BrokerMetadataValue(metadataCacheBasis: MetadataCacheBasis,
  * There is no single place where all broker metadata lives.  For example, MetadataCache holds some of it,
  * ReplicaManager holds some of it, etc.  This class can retrieve all of the pieces from the various locations
  * and stitch them together into a single BrokerMetadataValue, and it can take such a value and push its pieces out
- * to all the necessary destinations.  Each individual piece may itself be a {@link WriteableBasis} when
+ * to all the necessary destinations.  Each individual piece may be a {@link WriteableBasis} when
  * it is the only write path to that part of the metadata, and such pieces can change independently of each other.
  * The parts of the metadata that are not the only write path are represented by actions that can be applied.
  *
@@ -83,7 +83,7 @@ private class BrokerMetadataHolder(kafkaConfig: KafkaConfig,
                                    quotaManagers: QuotaFactory.QuotaManagers) extends ValueHolder[BrokerMetadataValue] {
   override def retrieveValue(): BrokerMetadataValue = {
     BrokerMetadataValue(new MetadataCacheBasis(metadataCache),
-      new GroupCoordinatorPartitionsToDelete(groupCoordinator),
+      new GroupCoordinatorPartitionsDeleted(groupCoordinator),
     new UpdateClientQuotaCallbackMetricConfigs(kafkaConfig, quotaManagers, metadataCache, clusterId))
   }
 
