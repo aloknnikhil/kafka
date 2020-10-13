@@ -402,7 +402,7 @@ case class MetadataSnapshot(partitionStates: mutable.AnyRefMap[String, mutable.L
 
 class MetadataCacheBasis(val metadataCache: MetadataCache,
                          metadataSnapshot: Option[MetadataSnapshot] = None
-                        ) extends WriteableBasis[MetadataSnapshot](metadataCache, metadataSnapshot) {
+                        ) extends Basis[MetadataSnapshot](metadataCache, metadataSnapshot) {
   override def newBasis(valueToWrite: MetadataSnapshot): MetadataCacheBasis = {
     super.newBasis(valueToWrite).asInstanceOf[MetadataCacheBasis]
   }

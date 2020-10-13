@@ -23,7 +23,7 @@ import org.apache.kafka.common.protocol.ApiMessage
 /**
  * There is no single place where all broker metadata lives.  For example, MetadataCache holds some of it,
  * ReplicaManager holds some of it, etc.  This class is a composite of the pieces from the various locations, and it
- * stitches the pieces together into a single value.  Each individual piece may be a {@link WriteableBasis} when
+ * stitches the pieces together into a single value.  Each individual piece may be a {@link Basis} when
  * it is the only write path to that part of the metadata, and such pieces can change independently of each other.
  * The parts of the metadata that are not the only write path are represented by actions that can be applied.
  *
@@ -66,7 +66,7 @@ case class BrokerMetadataValue(metadataCacheBasis: MetadataCacheBasis,
  * There is no single place where all broker metadata lives.  For example, MetadataCache holds some of it,
  * ReplicaManager holds some of it, etc.  This class can retrieve all of the pieces from the various locations
  * and stitch them together into a single BrokerMetadataValue, and it can take such a value and push its pieces out
- * to all the necessary destinations.  Each individual piece may be a {@link WriteableBasis} when
+ * to all the necessary destinations.  Each individual piece may be a {@link Basis} when
  * it is the only write path to that part of the metadata, and such pieces can change independently of each other.
  * The parts of the metadata that are not the only write path are represented by actions that can be applied.
  *
@@ -95,7 +95,7 @@ private class BrokerMetadataHolder(kafkaConfig: KafkaConfig,
 /**
  * There is no single place where all broker metadata lives.  For example, MetadataCache holds some of it,
  * ReplicaManager holds some of it, etc.  This class stitches the various pieces together and presents them as a single
- * {@link WriteableBasis}.  Each individual piece may itself be a {@link WriteableBasis} when
+ * {@link Basis}.  Each individual piece may itself be a {@link Basis} when
  * it is the only write path to that part of the metadata, and such pieces can change independently of each other.
  * The parts of the metadata that are not the only write path are represented by actions that can be applied.
  * There are methods to create a new basis from the current one with changes to an underlying basis or an action.
@@ -111,7 +111,7 @@ class BrokerMetadataBasis(val kafkaConfig: KafkaConfig,
                           metadataCache: MetadataCache,
                           val groupCoordinator: GroupCoordinator,
                           val quotaManagers: QuotaFactory.QuotaManagers)
-  extends WriteableBasis[BrokerMetadataValue](
+  extends Basis[BrokerMetadataValue](
     new BrokerMetadataHolder(kafkaConfig, clusterId, metadataCache, groupCoordinator, quotaManagers)) {
 
   override def newBasis(valueToWrite: BrokerMetadataValue): BrokerMetadataBasis = {

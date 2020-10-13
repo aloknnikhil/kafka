@@ -18,35 +18,6 @@
 package kafka.server
 
 /**
- * A stable basis upon which we can act to create a new basis and that we can write to some destination.
- *
- * This is appropriate to use when it is the only write path to the value.
- *
- * @tparam T the value type
- */
-trait Basis[T] {
-  /**
-   * Get the value associated with this basis
-   *
-   * @return the value corresponding to this basis
-   */
-  def getValue() : T
-
-  /**
-   * Create a new basis associated with the given value
-   *
-   * @param value the value corresponding to the new basis
-   * @return the new basis
-   */
-  def newBasis(value: T) : Basis[T]
-
-  /**
-   * Write the value to its destination if necessary.  This method is idempotent.
-   */
-  def writeIfNecessary(): Unit
-}
-
-/**
  * The ability to retrieve or write a value.
  *
  * This is appropriate to use when it is the only write path to the value.
@@ -72,14 +43,12 @@ trait ValueHolder[T] {
  * @param valueToWrite the new value to write
  * @tparam T the value type
  */
-class WriteableBasis[T](valueHolder: ValueHolder[T],
-                        valueToWrite: Option[T] = None
-                       ) extends Basis[T] {
+class Basis[T](valueHolder: ValueHolder[T], valueToWrite: Option[T] = None) {
   private var value: Option[T] = valueToWrite
   private val hasDifferentValue = value.isDefined
   private var written = false
 
-  override def getValue(): T = {
+  def getValue(): T = {
     // retrieve if necessary
     if (value.isEmpty) {
       value = Some(valueHolder.retrieveValue())
@@ -87,12 +56,12 @@ class WriteableBasis[T](valueHolder: ValueHolder[T],
     value.get
   }
 
-  override def newBasis(valueToWrite: T): WriteableBasis[T] = {
+  def newBasis(valueToWrite: T): Basis[T] = {
     // create and return a new basis containing the new value; it will write that value to the destination on-demand
-    new WriteableBasis(valueHolder, Some(valueToWrite))
+    new Basis(valueHolder, Some(valueToWrite))
   }
 
-  override def writeIfNecessary(): Unit = {
+  def writeIfNecessary(): Unit = {
     // only write if we have a different value than the one that is already held and we haven't written that value yet
     if (hasDifferentValue && !written) {
       value.foreach(v => valueHolder.writeValue(v))
