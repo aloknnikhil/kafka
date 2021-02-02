@@ -749,6 +749,7 @@ project(':core') {
 
   dependencies {
     compile project(':clients')
+    compile project(':metadata')
     compile project(':raft')
     compile libs.jacksonDatabind
     compile libs.jacksonModuleScala
@@ -791,6 +792,8 @@ project(':core') {
     testCompile libs.apachedsMavibotPartition
     testCompile libs.apachedsJdbmPartition
     testCompile libs.junitJupiter
+    testCompile libs.junitJupiterApi
+    testCompile libs.junitVintageEngine
     testCompile libs.slf4jlog4j
     testCompile(libs.jfreechart) {
       exclude group: 'junit', module: 'junit'
