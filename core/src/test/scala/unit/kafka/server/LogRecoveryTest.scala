@@ -106,7 +106,7 @@ class LogRecoveryTest extends ZooKeeperTestHarness {
 
     // give some time for the follower 1 to record leader HW
     TestUtils.waitUntilTrue(() =>
-      server2.replicaManager.localLogOrException(topicPartition).highWatermark == numMessages,
+      server2.replicaManager.localOnlineLogOrException(topicPartition).highWatermark == numMessages,
       "Failed to update high watermark for follower after timeout")
 
     servers.foreach(_.replicaManager.checkpointHighWatermarks())
@@ -149,7 +149,7 @@ class LogRecoveryTest extends ZooKeeperTestHarness {
       * is that server1 has caught up on the topicPartition, and has joined the ISR.
       * In the line below, we wait until the condition is met before shutting down server2
       */
-    waitUntilTrue(() => server2.replicaManager.nonOfflinePartition(topicPartition).get.inSyncReplicaIds.size == 2,
+    waitUntilTrue(() => server2.replicaManager.onlinePartition(topicPartition).get.inSyncReplicaIds.size == 2,
       "Server 1 is not able to join the ISR after restart")
 
 
@@ -168,7 +168,7 @@ class LogRecoveryTest extends ZooKeeperTestHarness {
 
     // give some time for follower 1 to record leader HW of 60
     TestUtils.waitUntilTrue(() =>
-      server2.replicaManager.localLogOrException(topicPartition).highWatermark == hw,
+      server2.replicaManager.localOnlineLogOrException(topicPartition).highWatermark == hw,
       "Failed to update high watermark for follower after timeout")
     // shutdown the servers to allow the hw to be checkpointed
     servers.foreach(_.shutdown())
@@ -182,7 +182,7 @@ class LogRecoveryTest extends ZooKeeperTestHarness {
     val hw = 20L
     // give some time for follower 1 to record leader HW of 600
     TestUtils.waitUntilTrue(() =>
-      server2.replicaManager.localLogOrException(topicPartition).highWatermark == hw,
+      server2.replicaManager.localOnlineLogOrException(topicPartition).highWatermark == hw,
       "Failed to update high watermark for follower after timeout")
     // shutdown the servers to allow the hw to be checkpointed
     servers.foreach(_.shutdown())
@@ -201,7 +201,7 @@ class LogRecoveryTest extends ZooKeeperTestHarness {
 
     // allow some time for the follower to get the leader HW
     TestUtils.waitUntilTrue(() =>
-      server2.replicaManager.localLogOrException(topicPartition).highWatermark == hw,
+      server2.replicaManager.localOnlineLogOrException(topicPartition).highWatermark == hw,
       "Failed to update high watermark for follower after timeout")
     // kill the server hosting the preferred replica
     server1.shutdown()
@@ -228,11 +228,11 @@ class LogRecoveryTest extends ZooKeeperTestHarness {
     hw += 2
 
     // allow some time for the follower to create replica
-    TestUtils.waitUntilTrue(() => server1.replicaManager.localLog(topicPartition).nonEmpty,
+    TestUtils.waitUntilTrue(() => server1.replicaManager.localOnlineLog(topicPartition).nonEmpty,
       "Failed to create replica in follower after timeout")
     // allow some time for the follower to get the leader HW
     TestUtils.waitUntilTrue(() =>
-      server1.replicaManager.localLogOrException(topicPartition).highWatermark == hw,
+      server1.replicaManager.localOnlineLogOrException(topicPartition).highWatermark == hw,
       "Failed to update high watermark for follower after timeout")
     // shutdown the servers to allow the hw to be checkpointed
     servers.foreach(_.shutdown())

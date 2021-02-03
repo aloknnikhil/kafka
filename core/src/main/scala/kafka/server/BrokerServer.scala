@@ -190,7 +190,7 @@ class BrokerServer(
       this.replicaManager = new ReplicaManager(config, metrics, time, None,
         kafkaScheduler, logManager, isShuttingDown, quotaManagers,
         brokerTopicStats, metadataCache, logDirFailureChannel, alterIsrManager,
-        configRepository, threadNamePrefix)
+        configRepository, threadNamePrefix, true)
 
       /* start broker-to-controller channel managers */
       val controllerNodes =

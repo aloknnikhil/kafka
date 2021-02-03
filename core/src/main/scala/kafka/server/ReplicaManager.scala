@@ -30,10 +30,9 @@ import kafka.controller.{KafkaController, StateChangeLogger}
 import kafka.log._
 import kafka.metrics.KafkaMetricsGroup
 import kafka.server.{FetchMetadata => SFetchMetadata}
-import kafka.server.HostedPartition.Online
 import kafka.server.QuotaFactory.QuotaManagers
 import kafka.server.checkpoints.{LazyOffsetCheckpoints, OffsetCheckpointFile, OffsetCheckpoints}
-import kafka.server.metadata.{ConfigRepository, MetadataBroker, MetadataImageBuilder, MetadataPartition, MetadataPartitions, ZkConfigRepository}
+import kafka.server.metadata.{ConfigRepository, MetadataBroker, MetadataBrokers, MetadataImageBuilder, MetadataPartition, ZkConfigRepository}
 import kafka.utils._
 import kafka.utils.Implicits._
 import kafka.zk.{AdminZkClient, KafkaZkClient}
@@ -142,7 +141,6 @@ case class FetchPartitionData(error: Errors = Errors.NONE,
                               preferredReadReplica: Option[Int],
                               isReassignmentFetch: Boolean)
 
-
 /**
  * Trait to represent the state of hosted partitions. We create a concrete (active) Partition
  * instance when the broker receives a LeaderAndIsr request from the controller indicating
@@ -159,6 +157,17 @@ object HostedPartition {
    * This broker hosts the partition and it is online.
    */
   final case class Online(partition: Partition) extends HostedPartition
+
+  /**
+   * This broker hosted the partition but it is deferring changes; status is unknown
+   * (this only applies to brokers that are using a Raft-based metadata
+   * quorum; it never happens when using ZooKeeper).
+   */
+  final case class Deferred(partition: Partition,
+                            metadata: MetadataPartition,
+                            wasNew: Boolean,
+                            mostRecentMetadataOffset: Long,
+                            onLeadershipChange: (Iterable[Partition], Iterable[Partition]) => Unit) extends HostedPartition
 
   /**
    * This broker hosts the partition, but it is in an offline log directory.
@@ -205,7 +214,8 @@ class ReplicaManager(val config: KafkaConfig,
                      val delayedElectLeaderPurgatory: DelayedOperationPurgatory[DelayedElectLeader],
                      threadNamePrefix: Option[String],
                      val configRepository: ConfigRepository,
-                     val alterIsrManager: AlterIsrManager)
+                     val alterIsrManager: AlterIsrManager,
+                     usingRaftMetadataQuorum: Boolean)
     extends Logging with KafkaMetricsGroup {
 
   def this(config: KafkaConfig,
@@ -221,7 +231,8 @@ class ReplicaManager(val config: KafkaConfig,
            logDirFailureChannel: LogDirFailureChannel,
            alterIsrManager: AlterIsrManager,
            configRepository: ConfigRepository,
-           threadNamePrefix: Option[String]) = {
+           threadNamePrefix: Option[String],
+           usingRaftMetadataQuorum: Boolean) = {
     this(config, metrics, time, zkClient, scheduler, logManager, isShuttingDown,
       quotaManagers, brokerTopicStats, metadataCache, logDirFailureChannel,
       DelayedOperationPurgatory[DelayedProduce](
@@ -235,7 +246,7 @@ class ReplicaManager(val config: KafkaConfig,
         purgeInterval = config.deleteRecordsPurgatoryPurgeIntervalRequests),
       DelayedOperationPurgatory[DelayedElectLeader](
         purgatoryName = "ElectLeader", brokerId = config.brokerId),
-      threadNamePrefix, configRepository, alterIsrManager)
+      threadNamePrefix, configRepository, alterIsrManager, usingRaftMetadataQuorum)
   }
 
   def this(config: KafkaConfig,
@@ -250,10 +261,11 @@ class ReplicaManager(val config: KafkaConfig,
            metadataCache: MetadataCache,
            logDirFailureChannel: LogDirFailureChannel,
            alterIsrManager: AlterIsrManager,
-           threadNamePrefix: Option[String] = None) = {
+           threadNamePrefix: Option[String] = None,
+           usingRaftMetadataQuorum: Boolean = false) = {
     this(config, metrics, time, Some(zkClient), scheduler, logManager, isShuttingDown,
       quotaManagers, brokerTopicStats, metadataCache, logDirFailureChannel, alterIsrManager,
-      new ZkConfigRepository(new AdminZkClient(zkClient)), threadNamePrefix)
+      new ZkConfigRepository(new AdminZkClient(zkClient)), threadNamePrefix, usingRaftMetadataQuorum)
   }
 
   /* epoch of the controller that last changed the leader */
@@ -279,6 +291,109 @@ class ReplicaManager(val config: KafkaConfig,
   private val lastIsrPropagationMs = new AtomicLong(time.milliseconds())
 
   private var logDirFailureHandler: LogDirFailureHandler = null
+
+  // Changes are initially deferrable when using a Raft-based metadata quorum, and may flip-flop thereafter;
+  // changes are never deferrable when using ZooKeeper.  When true, this indicates that we should transition online
+  // partitions to the deferred state if we see metadata with a different leader epoch.
+  @volatile private var changesDeferrable: Boolean = usingRaftMetadataQuorum
+  stateChangeLogger.info(s"Metadata changes deferrable=$changesDeferrable")
+
+  def deferrableMetadataChanges(): Unit = {
+    replicaStateChangeLock synchronized {
+      changesDeferrable = true
+      stateChangeLogger.info(s"Metadata changes are now deferrable")
+    }
+  }
+
+  private def applyDeferredMetadataChanges(): Unit = {
+    val startMs = time.milliseconds()
+    replicaStateChangeLock synchronized {
+      stateChangeLogger.info(s"Applying deferred metadata changes")
+      val highWatermarkCheckpoints = new LazyOffsetCheckpoints(this.highWatermarkCheckpoints)
+      val partitionsMadeFollower = mutable.Set[Partition]()
+      val partitionsMadeLeader = mutable.Set[Partition]()
+      val leadershipChangeCallbacks =
+        mutable.Map[(Iterable[Partition], Iterable[Partition]) => Unit, (mutable.Set[Partition], mutable.Set[Partition])]()
+      try {
+        val leaderPartitionStates = mutable.Map[Partition, MetadataPartition]()
+        val followerPartitionStates = mutable.Map[Partition, MetadataPartition]()
+        val partitionsAlreadyExisting = mutable.Set[MetadataPartition]()
+        val mostRecentMetadataOffsets = mutable.Map[Partition, Long]()
+        deferredPartitionsIterator.foreach { deferredPartition =>
+          val state = deferredPartition.metadata
+          val partition = deferredPartition.partition
+          if (state.leaderId == localBrokerId) {
+            leaderPartitionStates.put(partition, state)
+          } else {
+            followerPartitionStates.put(partition, state)
+          }
+          if (!deferredPartition.wasNew) {
+            partitionsAlreadyExisting += state
+          }
+          mostRecentMetadataOffsets.put(partition, deferredPartition.mostRecentMetadataOffset)
+        }
+
+        val partitionsMadeLeader = makeLeaders(partitionsAlreadyExisting, leaderPartitionStates,
+          highWatermarkCheckpoints,-1, mostRecentMetadataOffsets)
+        val partitionsMadeFollower = makeFollowers(partitionsAlreadyExisting,
+          metadataCache.currentImage().brokers, followerPartitionStates,
+          highWatermarkCheckpoints, -1, mostRecentMetadataOffsets)
+
+        // We need to transition anything that hasn't transitioned from Deferred to Offline to the Online state.
+        // We also need to identify the leadership change callback(s) to invoke
+        deferredPartitionsIterator.foreach { deferredPartition =>
+          val state = deferredPartition.metadata
+          val partition = deferredPartition.partition
+          val topicPartition = partition.topicPartition
+          // identify for callback if necessary
+          if (state.leaderId == localBrokerId) {
+            if (partitionsMadeLeader.contains(partition)) {
+              leadershipChangeCallbacks.getOrElseUpdate(
+                deferredPartition.onLeadershipChange, (mutable.Set(), mutable.Set()))._1 += partition
+            }
+          } else if (partitionsMadeFollower.contains(partition)) {
+            leadershipChangeCallbacks.getOrElseUpdate(
+              deferredPartition.onLeadershipChange, (mutable.Set(), mutable.Set()))._2 += partition
+          }
+          // transition from Deferred to Online
+          allPartitions.put(topicPartition, HostedPartition.Online(partition))
+        }
+
+        updateLeaderAndFollowerMetrics(partitionsMadeFollower.map(_.topic).toSet)
+
+        maybeAddLogDirFetchers(partitionsMadeFollower, highWatermarkCheckpoints)
+
+        replicaFetcherManager.shutdownIdleFetcherThreads()
+        replicaAlterLogDirsManager.shutdownIdleFetcherThreads()
+        leadershipChangeCallbacks.forKeyValue { (onLeadershipChange, leaderAndFollowerPartitions) =>
+          onLeadershipChange(leaderAndFollowerPartitions._1, leaderAndFollowerPartitions._2)
+        }
+      } catch {
+        case e: Throwable =>
+          deferredPartitionsIterator.foreach { metadata =>
+            val state = metadata.metadata
+            val partition = metadata.partition
+            val topicPartition = partition.topicPartition
+            val mostRecentMetadataOffset = metadata.mostRecentMetadataOffset
+            val leader = state.leaderId == localBrokerId
+            val leaderOrFollower = if (leader) "leader" else "follower"
+            val partitionLogMsgPrefix = s"Apply deferred $leaderOrFollower partition $topicPartition last seen in metadata batch $mostRecentMetadataOffset"
+            stateChangeLogger.error(s"$partitionLogMsgPrefix: error while applying deferred metadata.", e)
+          }
+          stateChangeLogger.info(s"Applied ${partitionsMadeLeader.size + partitionsMadeFollower.size} deferred partitions prior to the error: " +
+            s"${partitionsMadeLeader.size} leader(s) and ${partitionsMadeFollower.size} follower(s)")
+          // Re-throw the exception for it to be caught in BrokerMetadataListener
+          throw e
+      }
+      changesDeferrable = false
+      val endMs = time.milliseconds()
+      val elapsedMs = endMs - startMs
+      stateChangeLogger.info(s"Applied ${partitionsMadeLeader.size + partitionsMadeFollower.size} deferred partitions: " +
+        s"${partitionsMadeLeader.size} leader(s) and ${partitionsMadeFollower.size} follower(s)" +
+        s"in $elapsedMs ms")
+      stateChangeLogger.info("Metadata changes are not deferrable")
+    }
+  }
 
   private class LogDirFailureHandler(name: String, haltBrokerOnDirFailure: Boolean) extends ShutdownableThread(name) {
     override def doWork(): Unit = {
@@ -383,14 +498,16 @@ class ReplicaManager(val config: KafkaConfig,
     val haltBrokerOnFailure = config.interBrokerProtocolVersion < KAFKA_1_0_IV0
     logDirFailureHandler = new LogDirFailureHandler("LogDirFailureHandler", haltBrokerOnFailure)
     logDirFailureHandler.start()
+    applyDeferredMetadataChanges()
   }
 
   private def maybeRemoveTopicMetrics(topic: String): Unit = {
-    val topicHasOnlinePartition = allPartitions.values.exists {
+    val topicHasOnlineOrDeferredPartition = allPartitions.values.exists {
       case HostedPartition.Online(partition) => topic == partition.topic
+      case HostedPartition.Deferred(partition, _, _, _, _) => topic == partition.topic
       case HostedPartition.None | HostedPartition.Offline => false
     }
-    if (!topicHasOnlinePartition)
+    if (!topicHasOnlineOrDeferredPartition)
       brokerTopicStats.removeMetrics(topic)
   }
 
@@ -427,44 +544,48 @@ class ReplicaManager(val config: KafkaConfig,
         this.controllerEpoch = controllerEpoch
 
         val stoppedPartitions = mutable.Map.empty[TopicPartition, StopReplicaPartitionState]
-        partitionStates.forKeyValue { (topicPartition, partitionState) =>
-          val deletePartition = partitionState.deletePartition
 
+        def stopReplicaForPartition(topicPartition: TopicPartition, partition: Partition, partitionState: StopReplicaPartitionState) = {
+          val deletePartition = partitionState.deletePartition()
+          val currentLeaderEpoch = partition.getLeaderEpoch
+          val requestLeaderEpoch = partitionState.leaderEpoch
+          // When a topic is deleted, the leader epoch is not incremented. To circumvent this,
+          // a sentinel value (EpochDuringDelete) overwriting any previous epoch is used.
+          // When an older version of the StopReplica request which does not contain the leader
+          // epoch, a sentinel value (NoEpoch) is used and bypass the epoch validation.
+          if (requestLeaderEpoch == LeaderAndIsr.EpochDuringDelete ||
+            requestLeaderEpoch == LeaderAndIsr.NoEpoch ||
+            requestLeaderEpoch > currentLeaderEpoch) {
+            stoppedPartitions += topicPartition -> partitionState
+            // Assume that everything will go right. It is overwritten in case of an error.
+            responseMap.put(topicPartition, Errors.NONE)
+          } else if (requestLeaderEpoch < currentLeaderEpoch) {
+            stateChangeLogger.warn(s"Ignoring StopReplica request (delete=$deletePartition) from " +
+              s"controller $controllerId with correlation id $correlationId " +
+              s"epoch $controllerEpoch for partition $topicPartition since its associated " +
+              s"leader epoch $requestLeaderEpoch is smaller than the current " +
+              s"leader epoch $currentLeaderEpoch")
+            responseMap.put(topicPartition, Errors.FENCED_LEADER_EPOCH)
+          } else {
+            stateChangeLogger.info(s"Ignoring StopReplica request (delete=$deletePartition) from " +
+              s"controller $controllerId with correlation id $correlationId " +
+              s"epoch $controllerEpoch for partition $topicPartition since its associated " +
+              s"leader epoch $requestLeaderEpoch matches the current leader epoch")
+            responseMap.put(topicPartition, Errors.FENCED_LEADER_EPOCH)
+          }
+        }
+
+        partitionStates.forKeyValue { (topicPartition, partitionState) =>
           getPartition(topicPartition) match {
             case HostedPartition.Offline =>
-              stateChangeLogger.warn(s"Ignoring StopReplica request (delete=$deletePartition) from " +
+              stateChangeLogger.warn(s"Ignoring StopReplica request (delete=${partitionState.deletePartition()} from " +
                 s"controller $controllerId with correlation id $correlationId " +
                 s"epoch $controllerEpoch for partition $topicPartition as the local replica for the " +
                 "partition is in an offline log directory")
               responseMap.put(topicPartition, Errors.KAFKA_STORAGE_ERROR)
 
-            case HostedPartition.Online(partition) =>
-              val currentLeaderEpoch = partition.getLeaderEpoch
-              val requestLeaderEpoch = partitionState.leaderEpoch
-              // When a topic is deleted, the leader epoch is not incremented. To circumvent this,
-              // a sentinel value (EpochDuringDelete) overwriting any previous epoch is used.
-              // When an older version of the StopReplica request which does not contain the leader
-              // epoch, a sentinel value (NoEpoch) is used and bypass the epoch validation.
-              if (requestLeaderEpoch == LeaderAndIsr.EpochDuringDelete ||
-                  requestLeaderEpoch == LeaderAndIsr.NoEpoch ||
-                  requestLeaderEpoch > currentLeaderEpoch) {
-                stoppedPartitions += topicPartition -> partitionState
-                // Assume that everything will go right. It is overwritten in case of an error.
-                responseMap.put(topicPartition, Errors.NONE)
-              } else if (requestLeaderEpoch < currentLeaderEpoch) {
-                stateChangeLogger.warn(s"Ignoring StopReplica request (delete=$deletePartition) from " +
-                  s"controller $controllerId with correlation id $correlationId " +
-                  s"epoch $controllerEpoch for partition $topicPartition since its associated " +
-                  s"leader epoch $requestLeaderEpoch is smaller than the current " +
-                  s"leader epoch $currentLeaderEpoch")
-                responseMap.put(topicPartition, Errors.FENCED_LEADER_EPOCH)
-              } else {
-                stateChangeLogger.info(s"Ignoring StopReplica request (delete=$deletePartition) from " +
-                  s"controller $controllerId with correlation id $correlationId " +
-                  s"epoch $controllerEpoch for partition $topicPartition since its associated " +
-                  s"leader epoch $requestLeaderEpoch matches the current leader epoch")
-                responseMap.put(topicPartition, Errors.FENCED_LEADER_EPOCH)
-              }
+            case HostedPartition.Online(partition) => stopReplicaForPartition(topicPartition, partition, partitionState)
+            case HostedPartition.Deferred(partition, _, _, _, _) => stopReplicaForPartition(topicPartition, partition, partitionState)
 
             case HostedPartition.None =>
               // Delete log and corresponding folders in case replica manager doesn't hold them anymore.
@@ -512,17 +633,24 @@ class ReplicaManager(val config: KafkaConfig,
 
     // Second remove deleted partitions from the partition map. Fetchers rely on the
     // ReplicaManager to get Partition's information so they must be stopped first.
+
+    def deletePartition(topicPartition: TopicPartition, hostedPartition: HostedPartition, partition: Partition) = {
+      if (allPartitions.remove(topicPartition, hostedPartition)) {
+        maybeRemoveTopicMetrics(topicPartition.topic)
+        // Logs are not deleted here. They are deleted in a single batch later on.
+        // This is done to avoid having to checkpoint for every deletions.
+        partition.delete()
+      }
+    }
+
     val partitionsToDelete = mutable.Set.empty[TopicPartition]
     partitionsToStop.forKeyValue { (topicPartition, shouldDelete) =>
       if (shouldDelete) {
         getPartition(topicPartition) match {
           case hostedPartition@HostedPartition.Online(partition) =>
-            if (allPartitions.remove(topicPartition, hostedPartition)) {
-              maybeRemoveTopicMetrics(topicPartition.topic)
-              // Logs are not deleted here. They are deleted in a single batch later on.
-              // This is done to avoid having to checkpoint for every deletions.
-              partition.delete()
-            }
+            deletePartition(topicPartition, hostedPartition, partition)
+          case hostedPartition@HostedPartition.Deferred(partition, _, _, _, _) =>
+            deletePartition(topicPartition, hostedPartition, partition)
           case _ =>
         }
         partitionsToDelete += topicPartition
@@ -545,32 +673,81 @@ class ReplicaManager(val config: KafkaConfig,
     Option(allPartitions.get(topicPartition)).getOrElse(HostedPartition.None)
   }
 
+  // This only considers online partitions; in particular, it does not consider deferred partitions
   def isAddingReplica(topicPartition: TopicPartition, replicaId: Int): Boolean = {
     getPartition(topicPartition) match {
-      case Online(partition) => partition.isAddingReplica(replicaId)
+      case HostedPartition.Online(partition) => partition.isAddingReplica(replicaId)
       case _ => false
     }
   }
 
-  // Visible for testing
+  // Creates an online partition; visible for testing
   def createPartition(topicPartition: TopicPartition): Partition = {
     val partition = Partition(topicPartition, time, this)
     allPartitions.put(topicPartition, HostedPartition.Online(partition))
     partition
   }
 
-  def nonOfflinePartition(topicPartition: TopicPartition): Option[Partition] = {
+  // Creates an deferred partition; visible for testing
+  private[server] def createDeferredPartition(topicPartition: TopicPartition,
+                                              metadata: MetadataPartition,
+                                              wasNew: Boolean,
+                                              mostRecentMetadataOffset: Long,
+                                              onLeadershipChange: (Iterable[Partition], Iterable[Partition]) => Unit): Partition = {
+    val partition = Partition(topicPartition, time, this)
+    allPartitions.put(topicPartition,
+      HostedPartition.Deferred(
+        partition,
+        metadata,
+        wasNew,
+        mostRecentMetadataOffset,
+        onLeadershipChange))
+    partition
+  }
+
+  // Returns online partitions only.
+  // Equivalent to deferredOrOnlinePartition() when using ZooKeeper
+  def onlinePartition(topicPartition: TopicPartition): Option[Partition] = {
     getPartition(topicPartition) match {
       case HostedPartition.Online(partition) => Some(partition)
+      case _ => None
+    }
+  }
+
+  // Returns online as well as deferred partitions.
+  // Equivalent to onlinePartition() when using ZooKeeper
+  private def deferredOrOnlinePartition(topicPartition: TopicPartition): Option[Partition] = {
+    getPartition(topicPartition) match {
+      case HostedPartition.Online(partition) => Some(partition)
+      case HostedPartition.Deferred(partition, _, _, _, _) => Some(partition)
       case HostedPartition.None | HostedPartition.Offline => None
     }
   }
 
-  // An iterator over all non offline partitions. This is a weakly consistent iterator; a partition made offline after
-  // the iterator has been constructed could still be returned by this iterator.
-  private def nonOfflinePartitionsIterator: Iterator[Partition] = {
+  private def isDeferred(topicPartition: TopicPartition): Boolean = {
+    getPartition(topicPartition) match {
+      case HostedPartition.Deferred(_, _, _, _, _) => true
+      case _ => false
+    }
+  }
+
+  // An iterator over all online partition only. This is a weakly consistent iterator; a partition made offline or deferred
+  // after the iterator has been constructed could still be returned by this iterator.
+  // Equivalent to deferredOrOnlinePartitionsIterator() when using ZooKeeper.
+  private def onlinePartitionsIterator: Iterator[Partition] = {
     allPartitions.values.iterator.flatMap {
       case HostedPartition.Online(partition) => Some(partition)
+      case _ => None
+    }
+  }
+
+  // An iterator over all deferred or online partitions. This is a weakly consistent iterator; a partition made offline after
+  // the iterator has been constructed could still be returned by this iterator.
+  // Equivalent to onlinePartitionsIterator() when using ZooKeeper.
+  private def deferredOrOnlinePartitionsIterator: Iterator[Partition] = {
+    allPartitions.values.iterator.flatMap {
+      case HostedPartition.Online(partition) => Some(partition)
+      case HostedPartition.Deferred(partition, _, _, _, _) => Some(partition)
       case HostedPartition.None | HostedPartition.Offline => None
     }
   }
@@ -579,8 +756,19 @@ class ReplicaManager(val config: KafkaConfig,
     allPartitions.values.iterator.count(_ == HostedPartition.Offline)
   }
 
-  def getPartitionOrException(topicPartition: TopicPartition): Partition = {
-    getPartitionOrError(topicPartition) match {
+  // An iterator over all deferred partitions. This is a weakly consistent iterator; a partition made off/online
+  // after the iterator has been constructed could still be returned by this iterator.
+  private def deferredPartitionsIterator: Iterator[HostedPartition.Deferred] = {
+    allPartitions.values.iterator.flatMap {
+      case deferred@HostedPartition.Deferred(_, _, _, _, _) => Some(deferred)
+      case _ => None
+    }
+  }
+
+  // Return the partition if it is online, otherwise raises an exception.
+  // Equivalent to deferredOrOnlinePartitionOrException() when using ZooKeeper.
+  def onlinePartitionOrException(topicPartition: TopicPartition): Partition = {
+    onlinePartitionOrError(topicPartition) match {
       case Left(Errors.KAFKA_STORAGE_ERROR) =>
         throw new KafkaStorageException(s"Partition $topicPartition is in an offline log directory")
 
@@ -591,9 +779,53 @@ class ReplicaManager(val config: KafkaConfig,
     }
   }
 
-  def getPartitionOrError(topicPartition: TopicPartition): Either[Errors, Partition] = {
+  // Return the partition if it is deferred or online, otherwise raises an exception.
+  // Equivalent to onlinePartitionOrException() when using ZooKeeper.
+  private def deferredOrOnlinePartitionOrException(topicPartition: TopicPartition): Partition = {
+    deferredOrOnlinePartitionOrError(topicPartition) match {
+      case Left(Errors.KAFKA_STORAGE_ERROR) =>
+        throw new KafkaStorageException(s"Partition $topicPartition is in an offline log directory")
+
+      case Left(error) =>
+        throw error.exception(s"Error while fetching partition state for $topicPartition")
+
+      case Right(partition) => partition
+    }
+  }
+
+  // Return the partition if it is online, otherwise an error.
+  // Equivalent to deferredOrOnlinePartitionOrError() when using ZooKeeper.
+  def onlinePartitionOrError(topicPartition: TopicPartition): Either[Errors, Partition] = {
     getPartition(topicPartition) match {
       case HostedPartition.Online(partition) =>
+        Right(partition)
+
+      case HostedPartition.Deferred(_, _, _, _, _) =>
+        Left(Errors.NOT_LEADER_OR_FOLLOWER)
+
+      case HostedPartition.Offline =>
+        Left(Errors.KAFKA_STORAGE_ERROR)
+
+      case HostedPartition.None if metadataCache.contains(topicPartition) =>
+        // The topic exists, but this broker is no longer a replica of it, so we return NOT_LEADER_OR_FOLLOWER which
+        // forces clients to refresh metadata to find the new location. This can happen, for example,
+        // during a partition reassignment if a produce request from the client is sent to a broker after
+        // the local replica has been deleted.
+        Left(Errors.NOT_LEADER_OR_FOLLOWER)
+
+      case HostedPartition.None =>
+        Left(Errors.UNKNOWN_TOPIC_OR_PARTITION)
+    }
+  }
+
+  // Return the partition if it is deferred or online, otherwise an error.
+  // Equivalent to onlinePartitionOrError() when using ZooKeeper.
+  private def deferredOrOnlinePartitionOrError(topicPartition: TopicPartition): Either[Errors, Partition] = {
+    getPartition(topicPartition) match {
+      case HostedPartition.Online(partition) =>
+        Right(partition)
+
+      case HostedPartition.Deferred(partition, _, _, _, _) =>
         Right(partition)
 
       case HostedPartition.Offline =>
@@ -611,24 +843,38 @@ class ReplicaManager(val config: KafkaConfig,
     }
   }
 
-  def localLogOrException(topicPartition: TopicPartition): Log = {
-    getPartitionOrException(topicPartition).localLogOrException
+  // Returns the Log for the partition if it is online and has one, otherwise raises an exception.
+  // Equivalent to localDeferredOrOnlineLogOrException() when using ZooKeeper.
+  def localOnlineLogOrException(topicPartition: TopicPartition): Log = {
+    onlinePartitionOrException(topicPartition).localLogOrException
   }
 
-  def futureLocalLogOrException(topicPartition: TopicPartition): Log = {
-    getPartitionOrException(topicPartition).futureLocalLogOrException
+  // Returns the future Log for the partition if it is online and has one, otherwise raises an exception.
+  // Equivalent to futureLocalDeferredOrOnlineLogOrException() when using ZooKeeper.
+  def futureLocalOnlineLogOrException(topicPartition: TopicPartition): Log = {
+    onlinePartitionOrException(topicPartition).futureLocalLogOrException
   }
 
-  def futureLogExists(topicPartition: TopicPartition): Boolean = {
-    getPartitionOrException(topicPartition).futureLog.isDefined
+  // Indicates if the partition is online and has a future Log.
+  // Equivalent to futureLocalDeferredOrOnlineLogExists() when using ZooKeeper.
+  def futureLocalOnlineLogExists(topicPartition: TopicPartition): Boolean = {
+    deferredOrOnlinePartitionOrException(topicPartition).futureLog.isDefined
   }
 
-  def localLog(topicPartition: TopicPartition): Option[Log] = {
-    nonOfflinePartition(topicPartition).flatMap(_.log)
+  // Returns the Log for the partition if it is online.
+  // Equivalent to futureLocalOnlineLogOrException() when using ZooKeeper.
+  def localOnlineLog(topicPartition: TopicPartition): Option[Log] = {
+    onlinePartition(topicPartition).flatMap(_.log)
+  }
+
+  // Returns the Log for the partition if it is deferred or online.
+  // Equivalent to localOnlineLog() when using ZooKeeper.
+  private def localDeferredOrOnlineLog(topicPartition: TopicPartition): Option[Log] = {
+    deferredOrOnlinePartition(topicPartition).flatMap(_.log)
   }
 
   def getLogDir(topicPartition: TopicPartition): Option[String] = {
-    localLog(topicPartition).map(_.parentDir)
+    localDeferredOrOnlineLog(topicPartition).map(_.parentDir)
   }
 
   /**
@@ -732,7 +978,7 @@ class ReplicaManager(val config: KafkaConfig,
         (topicPartition, LogDeleteRecordsResult(-1L, -1L, Some(new InvalidTopicException(s"Cannot delete records of internal topic ${topicPartition.topic}"))))
       } else {
         try {
-          val partition = getPartitionOrException(topicPartition)
+          val partition = onlinePartitionOrException(topicPartition)
           val logDeleteResult = partition.deleteRecordsOnLeader(requestedOffset)
           (topicPartition, logDeleteResult)
         } catch {
@@ -785,6 +1031,8 @@ class ReplicaManager(val config: KafkaConfig,
                 replicaAlterLogDirsManager.removeFetcherForPartitions(Set(topicPartition))
                 partition.removeFutureLocalReplica()
               }
+            case HostedPartition.Deferred(_, _, _, _, _) =>
+              throw new ReplicaNotAvailableException(s"Partition $topicPartition is deferred")
             case HostedPartition.Offline =>
               throw new KafkaStorageException(s"Partition $topicPartition is offline")
 
@@ -798,7 +1046,7 @@ class ReplicaManager(val config: KafkaConfig,
           logManager.maybeUpdatePreferredLogDir(topicPartition, destinationDir)
 
           // throw NotLeaderOrFollowerException if replica does not exist for the given partition
-          val partition = getPartitionOrException(topicPartition)
+          val partition = onlinePartitionOrException(topicPartition)
           partition.localLogOrException
 
           // If the destinationLDir is different from the current log directory of the replica:
@@ -808,7 +1056,7 @@ class ReplicaManager(val config: KafkaConfig,
           //   so that we can avoid creating future log for the same partition in multiple log directories.
           val highWatermarkCheckpoints = new LazyOffsetCheckpoints(this.highWatermarkCheckpoints)
           if (partition.maybeCreateFutureReplica(destinationDir, highWatermarkCheckpoints)) {
-            val futureLog = futureLocalLogOrException(topicPartition)
+            val futureLog = futureLocalOnlineLogOrException(topicPartition)
             logManager.abortAndPauseCleaning(topicPartition)
 
             val initialFetchState = InitialFetchState(BrokerEndPoint(config.brokerId, "localhost", -1),
@@ -891,7 +1139,7 @@ class ReplicaManager(val config: KafkaConfig,
   }
 
   def getLogEndOffsetLag(topicPartition: TopicPartition, logEndOffset: Long, isFuture: Boolean): Long = {
-    localLog(topicPartition) match {
+    localOnlineLog(topicPartition) match {
       case Some(log) =>
         if (isFuture)
           log.logEndOffset - logEndOffset
@@ -966,6 +1214,7 @@ class ReplicaManager(val config: KafkaConfig,
     def processFailedRecord(topicPartition: TopicPartition, t: Throwable) = {
       val logStartOffset = getPartition(topicPartition) match {
         case HostedPartition.Online(partition) => partition.logStartOffset
+        case HostedPartition.Deferred(_, _, _, _, _) => -1L
         case HostedPartition.None | HostedPartition.Offline => -1L
       }
       brokerTopicStats.topicStats(topicPartition.topic).failedProduceRequestRate.mark()
@@ -989,7 +1238,7 @@ class ReplicaManager(val config: KafkaConfig,
           Some(new InvalidTopicException(s"Cannot append to internal topic ${topicPartition.topic}"))))
       } else {
         try {
-          val partition = getPartitionOrException(topicPartition)
+          val partition = onlinePartitionOrException(topicPartition)
           val info = partition.appendRecordsToLeader(records, origin, requiredAcks)
           val numAppendedMessages = info.numMessages
 
@@ -1032,7 +1281,7 @@ class ReplicaManager(val config: KafkaConfig,
                               isolationLevel: Option[IsolationLevel],
                               currentLeaderEpoch: Optional[Integer],
                               fetchOnlyFromLeader: Boolean): Option[TimestampAndOffset] = {
-    val partition = getPartitionOrException(topicPartition)
+    val partition = onlinePartitionOrException(topicPartition)
     partition.fetchOffsetForTimestamp(timestamp, isolationLevel, currentLeaderEpoch, fetchOnlyFromLeader)
   }
 
@@ -1041,7 +1290,7 @@ class ReplicaManager(val config: KafkaConfig,
                                      maxNumOffsets: Int,
                                      isFromConsumer: Boolean,
                                      fetchOnlyFromLeader: Boolean): Seq[Long] = {
-    val partition = getPartitionOrException(topicPartition)
+    val partition = onlinePartitionOrException(topicPartition)
     partition.legacyFetchOffsetsForTimestamp(timestamp, maxNumOffsets, isFromConsumer, fetchOnlyFromLeader)
   }
 
@@ -1173,7 +1422,7 @@ class ReplicaManager(val config: KafkaConfig,
             s"remaining response limit $limitBytes" +
             (if (minOneMessage) s", ignoring response/partition size limits" else ""))
 
-        val partition = getPartitionOrException(tp)
+        val partition = onlinePartitionOrException(tp)
         val fetchTimeMs = time.milliseconds
 
         // If we are the leader, determine the preferred read-replica
@@ -1335,13 +1584,13 @@ class ReplicaManager(val config: KafkaConfig,
     !isReplicaInSync && quota.isThrottled(partition.topicPartition) && quota.isQuotaExceeded
   }
 
-  def getLogConfig(topicPartition: TopicPartition): Option[LogConfig] = localLog(topicPartition).map(_.config)
+  def getLogConfig(topicPartition: TopicPartition): Option[LogConfig] = localDeferredOrOnlineLog(topicPartition).map(_.config)
 
   def getMagic(topicPartition: TopicPartition): Option[Byte] = getLogConfig(topicPartition).map(_.messageFormatVersion.recordVersion.value)
 
   def maybeUpdateMetadataCache(correlationId: Int, updateMetadataRequest: UpdateMetadataRequest) : Seq[TopicPartition] =  {
     replicaStateChangeLock synchronized {
-      if(updateMetadataRequest.controllerEpoch < controllerEpoch) {
+      if (updateMetadataRequest.controllerEpoch < controllerEpoch) {
         val stateControllerEpochErrorMessage = s"Received update metadata request with correlation id $correlationId " +
           s"from an old controller ${updateMetadataRequest.controllerId} with epoch ${updateMetadataRequest.controllerEpoch}. " +
           s"Latest known controller epoch is $controllerEpoch"
@@ -1399,6 +1648,13 @@ class ReplicaManager(val config: KafkaConfig,
                   s"controller $controllerId with correlation id $correlationId " +
                   s"epoch $controllerEpoch for partition $topicPartition as the local replica for the " +
                   "partition is in an offline log directory")
+                responseMap.put(topicPartition, Errors.KAFKA_STORAGE_ERROR)
+                None
+              case HostedPartition.Deferred(_, _, _, _, _) =>
+                stateChangeLogger.warn(s"Ignoring LeaderAndIsr request from " +
+                  s"controller $controllerId with correlation id $correlationId " +
+                  s"epoch $controllerEpoch for partition $topicPartition as the local replica for the " +
+                  "partition is deferred (should not happen)")
                 responseMap.put(topicPartition, Errors.KAFKA_STORAGE_ERROR)
                 None
 
@@ -1464,13 +1720,13 @@ class ReplicaManager(val config: KafkaConfig,
 
           leaderAndIsrRequest.partitionStates.forEach { partitionState =>
             val topicPartition = new TopicPartition(partitionState.topicName, partitionState.partitionIndex)
-            /*
+          /*
            * If there is offline log directory, a Partition object may have been created by getOrCreatePartition()
            * before getOrCreateReplica() failed to create local replica due to KafkaStorageException.
            * In this case ReplicaManager.allPartitions will map this topic-partition to an empty Partition object.
            * we need to map this topic-partition to OfflinePartition instead.
            */
-            if (localLog(topicPartition).isEmpty)
+            if (localOnlineLog(topicPartition).isEmpty)
               markPartitionOffline(topicPartition)
           }
 
@@ -1531,55 +1787,74 @@ class ReplicaManager(val config: KafkaConfig,
     val builder = imageBuilder.partitionsBuilder()
     val startMs = time.milliseconds()
     replicaStateChangeLock synchronized {
+      val deferrable = changesDeferrable
       stateChangeLogger.info(("Metadata batch %d: %d local partition(s) changed, %d " +
         "local partition(s) removed.").format(metadataOffset, builder.localChanged().size,
           builder.localRemoved().size))
       if (stateChangeLogger.isTraceEnabled) {
         builder.localChanged().foreach { state =>
-          stateChangeLogger.trace(s"Metadata batch ${metadataOffset}: locally changed: ${state}")
+          stateChangeLogger.trace(s"Metadata batch $metadataOffset: locally changed: ${state}")
         }
         builder.localRemoved().foreach { state =>
-          stateChangeLogger.trace(s"Metadata batch ${metadataOffset}: locally removed: ${state}")
+          stateChangeLogger.trace(s"Metadata batch $metadataOffset: locally removed: ${state}")
         }
       }
       // First create the partition if it doesn't exist already
+      // partitionChangesToBeDeferred maps each partition to be deferred to its (current state, previous deferred state if any)
+      val partitionChangesToBeDeferred = mutable.HashMap[Partition, (MetadataPartition, Option[HostedPartition.Deferred])]()
       val partitionsToBeLeader = mutable.HashMap[Partition, MetadataPartition]()
       val partitionsToBeFollower = mutable.HashMap[Partition, MetadataPartition]()
       builder.localChanged().foreach { state =>
         val topicPartition = new TopicPartition(state.topicName, state.partitionIndex)
-        val partition = getPartition(topicPartition) match {
+        val (partition, priorDeferredMetadata) = getPartition(topicPartition) match {
           case HostedPartition.Offline =>
-            stateChangeLogger.warn(s"Ignoring handlePartitionChanges at ${metadataOffset} " +
+            stateChangeLogger.warn(s"Ignoring handlePartitionChanges at $metadataOffset " +
               s"for partition $topicPartition as the local replica for the partition is " +
               "in an offline log directory")
-            None
+            (None, None)
 
-          case HostedPartition.Online(partition) => Some(partition)
+          case HostedPartition.Online(partition) => (Some(partition), None)
+          case deferred@HostedPartition.Deferred(partition, _, _, _, _) => (Some(partition), Some(deferred))
 
           case HostedPartition.None =>
             val partition = Partition(topicPartition, time, this)
-            allPartitions.putIfNotExists(topicPartition, HostedPartition.Online(partition))
-            Some(partition)
+            if (!deferrable) {
+              allPartitions.putIfNotExists(topicPartition, HostedPartition.Online(partition))
+            }
+            (Some(partition), None)
         }
         partition.foreach { partition =>
-          if (state.leaderId == localBrokerId) {
+          val alreadyDeferred = priorDeferredMetadata.nonEmpty
+          if (alreadyDeferred || deferrable && partition.getLeaderEpoch != state.leaderEpoch) {
+            partitionChangesToBeDeferred.put(partition, (state, priorDeferredMetadata))
+          } else if (state.leaderId == localBrokerId) {
             partitionsToBeLeader.put(partition, state)
           } else {
             partitionsToBeFollower.put(partition, state)
           }
         }
       }
+      val prevPartitions = imageBuilder.prevImage.partitions
+      val changedPartitionsPreviouslyExisting = mutable.Set[MetadataPartition]()
+      builder.localChanged().foreach(metadataPartition =>
+        prevPartitions.get(metadataPartition.topicName, metadataPartition.partitionIndex).foreach(
+          changedPartitionsPreviouslyExisting.add))
+      val nextBrokers = imageBuilder.nextBrokers()
       val highWatermarkCheckpoints = new LazyOffsetCheckpoints(this.highWatermarkCheckpoints)
       val partitionsBecomeLeader = if (partitionsToBeLeader.nonEmpty)
-        makeLeaders(imageBuilder.prevImage.partitions, partitionsToBeLeader,
+        makeLeaders(changedPartitionsPreviouslyExisting, partitionsToBeLeader,
           highWatermarkCheckpoints, metadataOffset)
       else
         Set.empty[Partition]
       val partitionsBecomeFollower = if (partitionsToBeFollower.nonEmpty)
-        makeFollowers(imageBuilder, partitionsToBeFollower, highWatermarkCheckpoints,
+        makeFollowers(changedPartitionsPreviouslyExisting, nextBrokers, partitionsToBeFollower, highWatermarkCheckpoints,
           metadataOffset)
       else {
         Set.empty[Partition]
+      }
+      stateChangeLogger.info(s"Deferring metadata changes for ${partitionChangesToBeDeferred.size} partition(s)")
+      if (partitionChangesToBeDeferred.nonEmpty) {
+        makeDeferred(imageBuilder, partitionChangesToBeDeferred, metadataOffset, onLeadershipChange)
       }
 
       updateLeaderAndFollowerMetrics(partitionsBecomeFollower.map(_.topic).toSet)
@@ -1592,8 +1867,10 @@ class ReplicaManager(val config: KafkaConfig,
          * In this case ReplicaManager.allPartitions will map this topic-partition to an empty Partition object.
          * we need to map this topic-partition to OfflinePartition instead.
          */
-        if (localLog(topicPartition).isEmpty)
+        // only mark it offline if it isn't deferred
+        if (localOnlineLog(topicPartition).isEmpty && !isDeferred(topicPartition)) {
           markPartitionOffline(topicPartition)
+        }
       }
 
       maybeAddLogDirFetchers(partitionsBecomeFollower, highWatermarkCheckpoints)
@@ -1604,14 +1881,15 @@ class ReplicaManager(val config: KafkaConfig,
 
       // TODO: we should move aside log directories which have been deleted rather than
       // purging them from the disk immediately.
-      if (!builder.localRemoved().isEmpty) {
+      if (builder.localRemoved().nonEmpty) {
+        // we remove immediately even if we are deferring changes
         stopPartitions(builder.localRemoved().map(_.toTopicPartition() -> true).toMap).foreach {
           case (topicPartition, e) => if (e.isInstanceOf[KafkaStorageException]) {
-            stateChangeLogger.error(s"Metadata batch ${metadataOffset}: unable to delete " +
+            stateChangeLogger.error(s"Metadata batch $metadataOffset: unable to delete " +
               s"${topicPartition} as the local replica for the partition is in an offline " +
               "log directory")
           } else {
-            stateChangeLogger.error(s"Metadata batch ${metadataOffset}: unable to delete " +
+            stateChangeLogger.error(s"Metadata batch $metadataOffset: unable to delete " +
               s"${topicPartition} due to an unexpected ${e.getClass.getName} exception: " +
               s"${e.getMessage}")
           }
@@ -1620,7 +1898,7 @@ class ReplicaManager(val config: KafkaConfig,
     }
     val endMs = time.milliseconds()
     val elapsedMs = endMs - startMs
-    stateChangeLogger.info(s"Metadata batch ${metadataOffset}: handled replica changes " +
+    stateChangeLogger.info(s"Metadata batch $metadataOffset: handled replica changes " +
       s"in ${elapsedMs} ms")
   }
 
@@ -1653,53 +1931,58 @@ class ReplicaManager(val config: KafkaConfig,
       replicaAlterLogDirsManager.addFetcherForPartitions(futureReplicasAndInitialOffset)
   }
 
-  private def makeLeaders(prevPartitions: MetadataPartitions,
+  private def makeLeaders(prevPartitionsAlreadyExisting: Set[MetadataPartition],
                           partitionStates: Map[Partition, MetadataPartition],
                           highWatermarkCheckpoints: OffsetCheckpoints,
-                          metadataOffset: Long): Set[Partition] = {
-    val partitionsToMakeLeaders = mutable.Set[Partition]()
+                          defaultMetadataOffset: Long,
+                          metadataOffsets: Map[Partition, Long] = Map.empty): Set[Partition] = {
+    val partitionsMadeLeaders = mutable.Set[Partition]()
+    val traceLoggingEnabled = stateChangeLogger.isTraceEnabled
+    val deferredBatches = metadataOffsets.nonEmpty
+    val topLevelLogPrefix = if (deferredBatches)
+      "Metadata batch <multiple deferred>"
+    else
+      s"Metadata batch $defaultMetadataOffset"
     try {
       // First stop fetchers for all the partitions
       replicaFetcherManager.removeFetcherForPartitions(partitionStates.keySet.map(_.topicPartition))
-      stateChangeLogger.info(s"Metadata batch ${metadataOffset}: stopped " +
-        s"${partitionStates.size} fetcher(s)")
+      stateChangeLogger.info(s"$topLevelLogPrefix: stopped ${partitionStates.size} fetcher(s)")
       // Update the partition information to be the leader
       partitionStates.forKeyValue { (partition, state) =>
+        val metadataOffset = metadataOffsets.getOrElse(partition, defaultMetadataOffset)
+        val topicPartition = partition.topicPartition
+        val partitionLogMsgPrefix = if (deferredBatches)
+          s"Apply deferred leader partition $topicPartition last seen in metadata batch $metadataOffset"
+        else
+          s"Metadata batch $metadataOffset $topicPartition"
         try {
           val isrState = state.toLeaderAndIsrPartitionState(
-            prevPartitions.get(state.topicName, state.partitionIndex).isDefined)
+            !prevPartitionsAlreadyExisting(state))
           if (partition.makeLeader(isrState, highWatermarkCheckpoints)) {
-            partitionsToMakeLeaders += partition
+            partitionsMadeLeaders += partition
+            if (traceLoggingEnabled) {
+              stateChangeLogger.trace(s"$partitionLogMsgPrefix: completed the become-leader state change.")
+            }
           } else {
-            stateChangeLogger.info(s"Metadata batch ${metadataOffset}: skipped the " +
-              s"become-leader state change for ${partition.topicPartition} since it " +
-              "is already the leader.")
+            stateChangeLogger.info(s"$partitionLogMsgPrefix: skipped the " +
+              "become-leader state change since it is already the leader.")
           }
         } catch {
           case e: KafkaStorageException =>
-            stateChangeLogger.error(s"Metadata batch ${metadataOffset}: unable to make " +
-              s"${state.toTopicPartition()}) a leader because the replica for the " +
-              s"partition is offline due to disk error ${e}")
-            val dirOpt = getLogDir(partition.topicPartition)
+            stateChangeLogger.error(s"$partitionLogMsgPrefix: unable to make " +
+              s"leader because the replica for the partition is offline due to disk error $e")
+            val dirOpt = getLogDir(topicPartition)
             error(s"Error while making broker the leader for partition $partition in dir $dirOpt", e)
+            markPartitionOffline(topicPartition)
         }
       }
     } catch {
       case e: Throwable =>
-        partitionStates.keys.foreach { partition =>
-          stateChangeLogger.error(s"Metadata batch ${metadataOffset}: error while " +
-            "processing batch.", e)
-        }
+          stateChangeLogger.error(s"$topLevelLogPrefix: error while processing batch.", e)
         // Re-throw the exception for it to be caught in BrokerMetadataListener
         throw e
     }
-    if (stateChangeLogger.isTraceEnabled) {
-      partitionStates.keys.foreach { partition =>
-        stateChangeLogger.trace(s"Completed batch ${metadataOffset} become-leader " +
-          s"transition for partition ${partition.topicPartition}")
-      }
-    }
-    partitionsToMakeLeaders
+    partitionsMadeLeaders
   }
 
   /*
@@ -1779,101 +2062,167 @@ class ReplicaManager(val config: KafkaConfig,
     partitionsToMakeLeaders
   }
 
-  private def makeFollowers(builder: MetadataImageBuilder,
+  private def makeFollowers(prevPartitionsAlreadyExisting: Set[MetadataPartition],
+                            currentBrokers: MetadataBrokers,
                             partitionStates: Map[Partition, MetadataPartition],
                             highWatermarkCheckpoints: OffsetCheckpoints,
-                            metadataOffset: Long): Set[Partition] = {
+                            defaultMetadataOffset: Long,
+                            metadataOffsets: Map[Partition, Long] = Map.empty): Set[Partition] = {
     val traceLoggingEnabled = stateChangeLogger.isTraceEnabled
-    if (traceLoggingEnabled)
+    val deferredBatches = metadataOffsets.nonEmpty
+    val topLevelLogPrefix = if (deferredBatches)
+      "Metadata batch <multiple deferred>"
+    else
+      s"Metadata batch $defaultMetadataOffset"
+    if (traceLoggingEnabled) {
       partitionStates.forKeyValue { (partition, state) =>
-        stateChangeLogger.trace(s"Metadata batch ${metadataOffset}: starting the " +
-          s"become-follower transition for partition ${partition.topicPartition} with leader " +
-          s"${state.leaderId}")
+        val metadataOffset = metadataOffsets.getOrElse(partition, defaultMetadataOffset)
+        val topicPartition = partition.topicPartition
+        val partitionLogMsgPrefix = if (deferredBatches)
+          s"Apply deferred follower partition $topicPartition last seen in metadata batch $metadataOffset"
+        else
+          s"Metadata batch $metadataOffset $topicPartition"
+        stateChangeLogger.trace(s"$partitionLogMsgPrefix: starting the " +
+          s"become-follower transition with leader ${state.leaderId}")
+      }
     }
 
-    val partitionsToMakeFollower: mutable.Set[Partition] = mutable.Set()
-    val prevPartitions = builder.prevImage.partitions
+    val partitionsMadeFollower: mutable.Set[Partition] = mutable.Set()
+    // all brokers, including both alive and not
+    val acceptableLeaderBrokerIds = currentBrokers.iterator().map(broker => broker.id).toSet
+    val allBrokersByIdMap = currentBrokers.iterator().map(broker => broker.id -> broker).toMap
     try {
       partitionStates.forKeyValue { (partition, state) =>
-        val tp = partition.topicPartition
+        val metadataOffset = metadataOffsets.getOrElse(partition, defaultMetadataOffset)
+        val topicPartition = partition.topicPartition
+        val partitionLogMsgPrefix = if (deferredBatches)
+          s"Apply deferred follower partition $topicPartition last seen in metadata batch $metadataOffset"
+        else
+          s"Metadata batch $metadataOffset $topicPartition"
         try {
-          val isNew = prevPartitions.get(state.topicName, state.partitionIndex).isDefined
-          builder.broker(state.leaderId) match {
-            // Only change partition state when the leader is available
-            case Some(_) =>
-              val isrState = state.toLeaderAndIsrPartitionState(isNew)
-              if (partition.makeFollower(isrState, highWatermarkCheckpoints))
-                partitionsToMakeFollower += partition
-              else
-                stateChangeLogger.info(s"Metadata batch ${metadataOffset}: skipped the " +
-                  s"become-follower state change for ${tp} since " +
-                  s"the new leader ${state.leaderId} is the same as the old leader.")
-            case None =>
-              // The leader broker should always be present in the metadata cache.
-              // If not, we should record the error message and abort the transition process for this partition
-              stateChangeLogger.error(s"Metadata batch ${metadataOffset}: " +
-                s"${partition.topicPartition} cannot become follower since the new " +
-                s"leader ${state.leaderId} is unavailable.")
-              // Create the local replica even if the leader is unavailable. This is required to ensure that we include
-              // the partition's high watermark in the checkpoint file (see KAFKA-1647)
-              partition.createLogIfNotExists(isNew, isFutureReplica = false,
-                highWatermarkCheckpoints)
+          val isNew = !prevPartitionsAlreadyExisting(state)
+          if (!acceptableLeaderBrokerIds.contains(state.leaderId)) {
+            // The leader broker should always be present in the metadata cache.
+            // If not, we should record the error message and abort the transition process for this partition
+            stateChangeLogger.error(s"$partitionLogMsgPrefix: cannot become follower " +
+              s"since the new leader ${state.leaderId} is unavailable.")
+            // Create the local replica even if the leader is unavailable. This is required to ensure that we include
+            // the partition's high watermark in the checkpoint file (see KAFKA-1647)
+            partition.createLogIfNotExists(isNew, isFutureReplica = false, highWatermarkCheckpoints)
+          } else {
+            val isrState = state.toLeaderAndIsrPartitionState(isNew)
+            if (partition.makeFollower(isrState, highWatermarkCheckpoints)) {
+              partitionsMadeFollower += partition
+              if (traceLoggingEnabled) {
+                stateChangeLogger.trace(s"$partitionLogMsgPrefix: completed the " +
+                  s"become-follower state change with new leader ${state.leaderId}.")
+              }
+            } else {
+              stateChangeLogger.info(s"$partitionLogMsgPrefix: skipped the " +
+                s"become-follower state change since " +
+                s"the new leader ${state.leaderId} is the same as the old leader.")
+            }
           }
         } catch {
           case e: KafkaStorageException =>
-            stateChangeLogger.error(s"Metadata batch ${metadataOffset}: skipped the " +
-              s"become-follower state change for ${partition.topicPartition} since the " +
-              s"replia for the partition is offline due to disk error ${e}")
+            stateChangeLogger.error(s"$partitionLogMsgPrefix: unable to complete the " +
+              s"become-follower state change since the " +
+              s"replica for the partition is offline due to disk error $e")
             val dirOpt = getLogDir(partition.topicPartition)
-            error(s"Error while making broker the follower for partition ${partition.topicPartition} with leader " +
-              s"${state.leaderId} in dir $dirOpt", e)
+            error(s"Error while making broker the follower with leader ${state.leaderId} in dir $dirOpt", e)
+            markPartitionOffline(topicPartition)
         }
       }
 
-      replicaFetcherManager.removeFetcherForPartitions(partitionsToMakeFollower.map(_.topicPartition))
-      stateChangeLogger.info(s"Metadata batch ${metadataOffset}: as part of become-follower request, " +
-        s"stopped followers for ${partitionsToMakeFollower.size} partitions")
+      if (partitionsMadeFollower.nonEmpty) {
+        replicaFetcherManager.removeFetcherForPartitions(partitionsMadeFollower.map(_.topicPartition))
+        stateChangeLogger.info(s"$topLevelLogPrefix: stopped followers for ${partitionsMadeFollower.size} partitions")
 
-      partitionsToMakeFollower.foreach { partition =>
-        completeDelayedFetchOrProduceRequests(partition.topicPartition)
-      }
+        partitionsMadeFollower.foreach { partition =>
+          completeDelayedFetchOrProduceRequests(partition.topicPartition)
+        }
 
-      if (isShuttingDown.get()) {
-        if (traceLoggingEnabled) {
-          partitionsToMakeFollower.foreach { partition =>
-            stateChangeLogger.trace(s"Metadata batch ${metadataOffset}: skipped the " +
-              s"adding-fetcher step of the become-follower state for " +
-              s"${partition.topicPartition} with leader ${partitionStates(partition).leaderId} " +
-              "since we are shutting down.")
+        if (isShuttingDown.get()) {
+          if (traceLoggingEnabled) {
+            partitionsMadeFollower.foreach { partition =>
+              val metadataOffset = metadataOffsets.getOrElse(partition, defaultMetadataOffset)
+              val topicPartition = partition.topicPartition
+              val partitionLogMsgPrefix = if (deferredBatches)
+                s"Apply deferred follower partition $topicPartition last seen in metadata batch $metadataOffset"
+              else
+                s"Metadata batch $metadataOffset $topicPartition"
+              stateChangeLogger.trace(s"$partitionLogMsgPrefix: skipped the " +
+                s"adding-fetcher step of the become-follower state for " +
+                s"$topicPartition since we are shutting down.")
+            }
           }
-        }
-      } else {
-        // we do not need to check if the leader exists again since this has been done at the beginning of this process
-        val partitionsToMakeFollowerWithLeaderAndOffset = partitionsToMakeFollower.map { partition =>
-          val leader = builder.broker(partition.leaderReplicaIdOpt.get).get.
-            brokerEndPoint(config.interBrokerListenerName)
-          val log = partition.localLogOrException
-          val fetchOffset = initialFetchOffset(log)
-          partition.topicPartition -> InitialFetchState(leader, partition.getLeaderEpoch, fetchOffset)
-        }.toMap
+        } else {
+          // we do not need to check if the leader exists again since this has been done at the beginning of this process
+          val partitionsToMakeFollowerWithLeaderAndOffset = partitionsMadeFollower.map { partition =>
+            val leader = allBrokersByIdMap(partition.leaderReplicaIdOpt.get).brokerEndPoint(config.interBrokerListenerName)
+            val log = partition.localLogOrException
+            val fetchOffset = initialFetchOffset(log)
+            partition.topicPartition -> InitialFetchState(leader, partition.getLeaderEpoch, fetchOffset)
+          }.toMap
 
-        replicaFetcherManager.addFetcherForPartitions(partitionsToMakeFollowerWithLeaderAndOffset)
+          replicaFetcherManager.addFetcherForPartitions(partitionsToMakeFollowerWithLeaderAndOffset)
+        }
       }
     } catch {
       case e: Throwable =>
-        stateChangeLogger.error(s"Metadata batch ${metadataOffset}: error while processing batch", e)
+        stateChangeLogger.error(s"$topLevelLogPrefix: error while processing batch", e)
         // Re-throw the exception for it to be caught in BrokerMetadataListener
         throw e
     }
 
     if (traceLoggingEnabled)
-      partitionStates.keys.foreach { partition =>
-        stateChangeLogger.trace(s"Completed batch ${metadataOffset} become-follower " +
-          s"transition for partition ${partition.topicPartition} with new leader " +
-          s"${partitionStates(partition).leaderId}")
+      partitionsMadeFollower.foreach { partition =>
+        val metadataOffset = metadataOffsets.getOrElse(partition, defaultMetadataOffset)
+        val topicPartition = partition.topicPartition
+        val partitionLogMsgPrefix = if (deferredBatches)
+          s"Apply deferred follower partition $topicPartition last seen in metadata batch $metadataOffset"
+        else
+          s"Metadata batch $metadataOffset $topicPartition"
+        val state = partitionStates(partition)
+        stateChangeLogger.trace(s"$partitionLogMsgPrefix: completed become-follower " +
+          s"transition for partition $topicPartition with new leader ${state.leaderId}")
       }
 
-    partitionsToMakeFollower
+    partitionsMadeFollower
+  }
+
+  private def makeDeferred(builder: MetadataImageBuilder,
+                           partitionStates: Map[Partition, (MetadataPartition, Option[HostedPartition.Deferred])],
+                           metadataOffset: Long,
+                           onLeadershipChange: (Iterable[Partition], Iterable[Partition]) => Unit) : Unit = {
+    val traceLoggingEnabled = stateChangeLogger.isTraceEnabled
+    if (traceLoggingEnabled)
+      partitionStates.forKeyValue { (partition, stateAndMetadata) =>
+        stateChangeLogger.trace(s"Metadata batch $metadataOffset: starting the " +
+          s"become-deferred transition for partition ${partition.topicPartition} with leader " +
+          s"${stateAndMetadata._1.leaderId}")
+      }
+
+    // Stop fetchers for all the partitions
+    replicaFetcherManager.removeFetcherForPartitions(partitionStates.keySet.map(_.topicPartition))
+    stateChangeLogger.info(s"Metadata batch $metadataOffset: as part of become-deferred request, " +
+      s"stopped any fetchers for ${partitionStates.size} partitions")
+    val prevPartitions = builder.prevImage.partitions
+    partitionStates.forKeyValue { (partition, currentAndOptionalPreviousDeferredState) =>
+      val currentState = currentAndOptionalPreviousDeferredState._1
+      val latestDeferredPartitionState = currentAndOptionalPreviousDeferredState._2
+      val isNew = prevPartitions.get(currentState.topicName, currentState.partitionIndex).isEmpty ||
+        latestDeferredPartitionState.isDefined && latestDeferredPartitionState.get.wasNew
+      allPartitions.put(partition.topicPartition,
+        HostedPartition.Deferred(partition, currentState, isNew, metadataOffset, onLeadershipChange))
+    }
+
+    if (traceLoggingEnabled)
+      partitionStates.keys.foreach { partition =>
+        stateChangeLogger.trace(s"Completed batch $metadataOffset become-deferred " +
+          s"transition for partition ${partition.topicPartition} with new leader " +
+          s"${partitionStates(partition)._1.leaderId}")
+      }
   }
 
   /*
@@ -2016,7 +2365,7 @@ class ReplicaManager(val config: KafkaConfig,
 
     // Shrink ISRs for non offline partitions
     allPartitions.keys.foreach { topicPartition =>
-      nonOfflinePartition(topicPartition).foreach(_.maybeShrinkIsr())
+      onlinePartition(topicPartition).foreach(_.maybeShrinkIsr())
     }
   }
 
@@ -2037,7 +2386,7 @@ class ReplicaManager(val config: KafkaConfig,
           s"log read returned error ${readResult.error}")
         readResult
       } else {
-        nonOfflinePartition(topicPartition) match {
+        deferredOrOnlinePartition(topicPartition) match {
           case Some(partition) =>
             if (partition.updateFollowerFetchState(followerId,
               followerFetchOffsetMetadata = readResult.info.fetchOffsetMetadata,
@@ -2062,10 +2411,10 @@ class ReplicaManager(val config: KafkaConfig,
   }
 
   private def leaderPartitionsIterator: Iterator[Partition] =
-    nonOfflinePartitionsIterator.filter(_.leaderLogIfLocal.isDefined)
+    onlinePartitionsIterator.filter(_.leaderLogIfLocal.isDefined)
 
   def getLogEndOffset(topicPartition: TopicPartition): Option[Long] =
-    nonOfflinePartition(topicPartition).flatMap(_.leaderLogIfLocal.map(_.logEndOffset))
+    deferredOrOnlinePartition(topicPartition).flatMap(_.leaderLogIfLocal.map(_.logEndOffset))
 
   // Flushes the highwatermark value for all partitions to the highwatermark file
   def checkpointHighWatermarks(): Unit = {
@@ -2078,7 +2427,7 @@ class ReplicaManager(val config: KafkaConfig,
 
     val logDirToHws = new mutable.AnyRefMap[String, mutable.AnyRefMap[TopicPartition, Long]](
       allPartitions.size)
-    nonOfflinePartitionsIterator.foreach { partition =>
+    onlinePartitionsIterator.foreach { partition =>
       partition.log.foreach(putHw(logDirToHws, _))
       partition.futureLog.foreach(putHw(logDirToHws, _))
     }
@@ -2092,7 +2441,6 @@ class ReplicaManager(val config: KafkaConfig,
     }
   }
 
-  // Used only by test
   def markPartitionOffline(tp: TopicPartition): Unit = replicaStateChangeLock synchronized {
     allPartitions.put(tp, HostedPartition.Offline)
     Partition.removeMetrics(tp)
@@ -2109,11 +2457,11 @@ class ReplicaManager(val config: KafkaConfig,
       return
     warn(s"Stopping serving replicas in dir $dir")
     replicaStateChangeLock synchronized {
-      val newOfflinePartitions = nonOfflinePartitionsIterator.filter { partition =>
+      val newOfflinePartitions = deferredOrOnlinePartitionsIterator.filter { partition =>
         partition.log.exists { _.parentDir == dir }
       }.map(_.topicPartition).toSet
 
-      val partitionsWithOfflineFutureReplica = nonOfflinePartitionsIterator.filter { partition =>
+      val partitionsWithOfflineFutureReplica = deferredOrOnlinePartitionsIterator.filter { partition =>
         partition.futureLog.exists { _.parentDir == dir }
       }.toSet
 
@@ -2206,7 +2554,7 @@ class ReplicaManager(val config: KafkaConfig,
               offsetForLeaderPartition.leaderEpoch,
               fetchOnlyFromLeader = true)
 
-          case HostedPartition.Offline =>
+          case HostedPartition.Offline | HostedPartition.Deferred(_, _, _, _, _) =>
             new EpochEndOffset()
               .setPartition(offsetForLeaderPartition.partition)
               .setErrorCode(Errors.KAFKA_STORAGE_ERROR.code)

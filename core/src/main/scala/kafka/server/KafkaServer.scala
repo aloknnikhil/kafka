@@ -388,7 +388,7 @@ class KafkaServer(
       time, config.brokerId, () => kafkaController.brokerEpoch)
     new ReplicaManager(config, metrics, time, Some(zkClient), kafkaScheduler, logManager,
       isShuttingDown, quotaManagers, brokerTopicStats, metadataCache, logDirFailureChannel,
-      alterIsrManager, new ZkConfigRepository(new AdminZkClient(zkClient)), None)
+      alterIsrManager, new ZkConfigRepository(new AdminZkClient(zkClient)), None, false)
   }
 
   private def initZkClient(time: Time): Unit = {

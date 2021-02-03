@@ -193,7 +193,7 @@ class ReplicaManagerTest {
           .setIsNew(false)).asJava,
         Set(new Node(0, "host1", 0), new Node(1, "host2", 1)).asJava).build()
       rm.becomeLeaderOrFollower(0, leaderAndIsrRequest1, (_, _) => ())
-      rm.getPartitionOrException(new TopicPartition(topic, 0))
+      rm.onlinePartitionOrException(new TopicPartition(topic, 0))
           .localLogOrException
 
       val records = MemoryRecords.withRecords(CompressionType.NONE, new SimpleRecord("first message".getBytes()))
@@ -252,7 +252,7 @@ class ReplicaManagerTest {
         Set(new Node(0, "host1", 0), new Node(1, "host2", 1)).asJava).build()
 
       replicaManager.becomeLeaderOrFollower(0, leaderAndIsrRequest(0), (_, _) => ())
-      val partition = replicaManager.getPartitionOrException(new TopicPartition(topic, 0))
+      val partition = replicaManager.onlinePartitionOrException(new TopicPartition(topic, 0))
       assertEquals(1, replicaManager.logManager.liveLogDirs.filterNot(_ == partition.log.get.dir.getParentFile).size)
 
       val previousReplicaFolder = partition.log.get.dir.getParentFile
@@ -261,7 +261,7 @@ class ReplicaManagerTest {
       assertEquals(0, replicaManager.replicaAlterLogDirsManager.fetcherThreadMap.size)
       replicaManager.alterReplicaLogDirs(Map(topicPartition -> newReplicaFolder.getAbsolutePath))
       // make sure the future log is created
-      replicaManager.futureLocalLogOrException(topicPartition)
+      replicaManager.futureLocalOnlineLogOrException(topicPartition)
       assertEquals(1, replicaManager.replicaAlterLogDirsManager.fetcherThreadMap.size)
       (1 to loopEpochChange).foreach(epoch => replicaManager.becomeLeaderOrFollower(0, leaderAndIsrRequest(epoch), (_, _) => ()))
       // wait for the ReplicaAlterLogDirsThread to complete
@@ -310,7 +310,7 @@ class ReplicaManagerTest {
           .setIsNew(true)).asJava,
         Set(new Node(0, "host1", 0), new Node(1, "host2", 1)).asJava).build()
       replicaManager.becomeLeaderOrFollower(0, leaderAndIsrRequest1, (_, _) => ())
-      replicaManager.getPartitionOrException(new TopicPartition(topic, 0))
+      replicaManager.onlinePartitionOrException(new TopicPartition(topic, 0))
         .localLogOrException
 
       val producerId = 234L
@@ -370,7 +370,7 @@ class ReplicaManagerTest {
           .setIsNew(true)).asJava,
         Set(new Node(0, "host1", 0), new Node(1, "host2", 1)).asJava).build()
       replicaManager.becomeLeaderOrFollower(0, leaderAndIsrRequest1, (_, _) => ())
-      replicaManager.getPartitionOrException(new TopicPartition(topic, 0))
+      replicaManager.onlinePartitionOrException(new TopicPartition(topic, 0))
         .localLogOrException
 
       val producerId = 234L
@@ -476,7 +476,7 @@ class ReplicaManagerTest {
           .setIsNew(true)).asJava,
         Set(new Node(0, "host1", 0), new Node(1, "host2", 1)).asJava).build()
       replicaManager.becomeLeaderOrFollower(0, leaderAndIsrRequest1, (_, _) => ())
-      replicaManager.getPartitionOrException(new TopicPartition(topic, 0))
+      replicaManager.onlinePartitionOrException(new TopicPartition(topic, 0))
         .localLogOrException
 
       val producerId = 234L
@@ -552,7 +552,7 @@ class ReplicaManagerTest {
           .setIsNew(false)).asJava,
         Set(new Node(0, "host1", 0), new Node(1, "host2", 1), new Node(2, "host2", 2)).asJava).build()
       rm.becomeLeaderOrFollower(0, leaderAndIsrRequest1, (_, _) => ())
-      rm.getPartitionOrException(new TopicPartition(topic, 0))
+      rm.onlinePartitionOrException(new TopicPartition(topic, 0))
         .localLogOrException
 
       // Append a couple of messages.
@@ -611,8 +611,8 @@ class ReplicaManagerTest {
       assertEquals(Errors.NONE, leaderAndIsrResponse.error)
 
       // Follower replica state is initialized, but initial state is not known
-      assertTrue(replicaManager.nonOfflinePartition(tp).isDefined)
-      val partition = replicaManager.nonOfflinePartition(tp).get
+      assertTrue(replicaManager.onlinePartition(tp).isDefined)
+      val partition = replicaManager.onlinePartition(tp).get
 
       assertTrue(partition.getReplica(1).isDefined)
       val followerReplica = partition.getReplica(1).get
@@ -769,12 +769,12 @@ class ReplicaManagerTest {
         isolationLevel = IsolationLevel.READ_UNCOMMITTED,
         clientMetadata = None
       )
-      val tp0Log = replicaManager.localLog(tp0)
+      val tp0Log = replicaManager.localOnlineLog(tp0)
       assertTrue(tp0Log.isDefined)
       assertEquals("hw should be incremented", 1, tp0Log.get.highWatermark)
 
-      replicaManager.localLog(tp1)
-      val tp1Replica = replicaManager.localLog(tp1)
+      replicaManager.localOnlineLog(tp1)
+      val tp1Replica = replicaManager.localOnlineLog(tp1)
       assertTrue(tp1Replica.isDefined)
       assertEquals("hw should not be incremented", 0, tp1Replica.get.highWatermark)
 
@@ -1535,7 +1535,7 @@ class ReplicaManagerTest {
       new AtomicBoolean(false), quotaManager, mockBrokerTopicStats,
       metadataCache, mockLogDirFailureChannel, mockProducePurgatory, mockFetchPurgatory,
       mockDeleteRecordsPurgatory, mockElectLeaderPurgatory, Option(this.getClass.getName),
-      new ZkConfigRepository(new AdminZkClient(kafkaZkClient)), alterIsrManager) {
+      new ZkConfigRepository(new AdminZkClient(kafkaZkClient)), alterIsrManager, false) {
 
       override protected def createReplicaFetcherManager(metrics: Metrics,
                                                      time: Time,
@@ -1712,7 +1712,7 @@ class ReplicaManagerTest {
       new AtomicBoolean(false), quotaManager, new BrokerTopicStats,
       metadataCache, new LogDirFailureChannel(config.logDirs.size), mockProducePurgatory, mockFetchPurgatory,
       mockDeleteRecordsPurgatory, mockDelayedElectLeaderPurgatory, Option(this.getClass.getName),
-      new ZkConfigRepository(new AdminZkClient(kafkaZkClient)), alterIsrManager)
+      new ZkConfigRepository(new AdminZkClient(kafkaZkClient)), alterIsrManager, false)
   }
 
   @Test
@@ -2163,7 +2163,7 @@ class ReplicaManagerTest {
       new ReplicaManager(config, metrics, time, kafkaZkClient, new MockScheduler(time), mockLogMgr,
         new AtomicBoolean(false), quotaManager, new BrokerTopicStats,
         new MetadataCache(config.brokerId), new LogDirFailureChannel(config.logDirs.size), alterIsrManager) {
-        override def getPartitionOrException(topicPartition: TopicPartition): Partition = {
+        override def onlinePartitionOrException(topicPartition: TopicPartition): Partition = {
           throw Errors.NOT_LEADER_OR_FOLLOWER.exception()
         }
       }
