@@ -365,7 +365,7 @@ class BrokerServer(
       if (config.controlledShutdownEnable) {
         lifecycleManager.beginControlledShutdown()
         try {
-          lifecycleManager.controlledShutdownFuture.get(5L, TimeUnit.MINUTES)
+          lifecycleManager.controlledShutdownFuture.get(300L, TimeUnit.MINUTES)
         } catch {
           case _: TimeoutException =>
             error("Timed out waiting for the controller to approve controlled shutdown")

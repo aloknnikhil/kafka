@@ -26,7 +26,6 @@ import org.junit.rules.Timeout
 import org.junit.{Assert, Rule, Test}
 
 import java.util
-import java.util.Collections
 import java.util.concurrent.TimeUnit
 import scala.compat.java8.OptionConverters
 import scala.jdk.CollectionConverters._
@@ -91,21 +90,27 @@ class Kip500ClusterTest {
       val admin = Admin.create(cluster.clientProperties())
       try {
         // Create a test topic
-        val newTopic = Collections.singletonList(new NewTopic("test-topic", 1, 3.toShort))
-        val createTopicResult = admin.createTopics(newTopic)
-        createTopicResult.all().get(60, TimeUnit.SECONDS)
-
-        // List created topic
-        TestUtils.waitUntilTrue(() => {
-          val listTopicsResult = admin.listTopics()
-          val result = listTopicsResult.names().get(5, TimeUnit.SECONDS).size() == newTopic.size()
-          if (result) {
-            newTopic forEach(topic => {
-              Assert.assertTrue(listTopicsResult.names().get().contains(topic.name()))
-            })
+        for (j <- 0 to 190) {
+          val newTopic = new util.ArrayList[NewTopic]()
+          for (i <- 0 to 1_000) {
+            newTopic.add(new NewTopic("test-topic-" + i + (j * 1000), 1, 1.toShort))
           }
-          result
-        }, "Topics created were not listed.")
+
+          val createTopicResult = admin.createTopics(newTopic)
+          createTopicResult.all().get(120, TimeUnit.SECONDS)
+
+          // List created topic
+          TestUtils.waitUntilTrue(() => {
+            val listTopicsResult = admin.listTopics()
+            val result = listTopicsResult.names().get(1200, TimeUnit.SECONDS).contains(newTopic.get(0).name())
+            if (result) {
+              newTopic forEach (topic => {
+                Assert.assertTrue(listTopicsResult.names().get().contains(topic.name()))
+              })
+            }
+            result
+          }, "Topics created were not listed.")
+        }
       } finally {
         admin.close()
       }

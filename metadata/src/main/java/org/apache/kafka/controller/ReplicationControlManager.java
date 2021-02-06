@@ -250,7 +250,7 @@ public class ReplicationControlManager {
     public void replay(TopicRecord record) {
         topicsByName.put(record.name(), record.topicId());
         topics.put(record.topicId(), new TopicControlInfo(snapshotRegistry, record.topicId()));
-        log.info("Created topic {} with ID {}.", record.name(), record.topicId());
+        //log.info("Created topic {} with ID {}.", record.name(), record.topicId());
     }
 
     public void replay(PartitionRecord record) {
@@ -262,8 +262,8 @@ public class ReplicationControlManager {
         PartitionControlInfo newPartInfo = new PartitionControlInfo(record);
         PartitionControlInfo prevPartInfo = topicInfo.parts.get(record.partitionId());
         if (prevPartInfo == null) {
-            log.info("Created partition {}:{} with {}.", record.topicId(),
-                record.partitionId(), newPartInfo.toString());
+//            log.info("Created partition {}:{} with {}.", record.topicId(),
+//                record.partitionId(), newPartInfo.toString());
             topicInfo.parts.put(record.partitionId(), newPartInfo);
             brokersToIsrs.update(record.topicId(), record.partitionId(), null,
                 newPartInfo.isr, -1, newPartInfo.leader);
@@ -356,7 +356,7 @@ public class ReplicationControlManager {
                 append("SUCCESS");
             resultsPrefix = ", ";
         }
-        log.info("createTopics result(s): {}", resultsBuilder.toString());
+        //log.info("createTopics result(s): {}", resultsBuilder.toString());
         return new ControllerResult<>(records, data);
     }
 

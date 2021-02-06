@@ -398,11 +398,12 @@ class Partition(val topicPartition: TopicPartition,
 
     def updateHighWatermark(log: Log) = {
       val checkpointHighWatermark = offsetCheckpoints.fetch(log.parentDir, topicPartition).getOrElse {
-        info(s"No checkpointed highwatermark is found for partition $topicPartition")
+        //info(s"No checkpointed highwatermark is found for partition $topicPartition")
         0L
       }
-      val initialHighWatermark = log.updateHighWatermark(checkpointHighWatermark)
-      info(s"Log loaded for partition $topicPartition with initial high watermark $initialHighWatermark")
+      //val initialHighWatermark =
+      log.updateHighWatermark(checkpointHighWatermark)
+      //info(s"Log loaded for partition $topicPartition with initial high watermark $initialHighWatermark")
     }
 
     logManager.initializingLog(topicPartition)

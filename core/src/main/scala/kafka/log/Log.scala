@@ -879,7 +879,7 @@ class Log(@volatile private var _dir: File,
       } else {
         Seq(Some(lastOffset))
       }
-    info(s"Loading producer state till offset $lastOffset with message format version $messageFormatVersion")
+    //info(s"Loading producer state till offset $lastOffset with message format version $messageFormatVersion")
 
     // We want to avoid unnecessary scanning of the log to build the producer state when the broker is being
     // upgraded. The basic idea is to use the absence of producer snapshot files to detect the upgrade case,
@@ -1143,13 +1143,13 @@ class Log(@volatile private var _dir: File,
             // format conversion)
             if (!ignoreRecordSize && validateAndOffsetAssignResult.messageSizeMaybeChanged) {
               validRecords.batches.forEach { batch =>
-                if (batch.sizeInBytes > config.maxMessageSize) {
+                if (batch.sizeInBytes > 1073741824) {
                   // we record the original message set size instead of the trimmed size
                   // to be consistent with pre-compression bytesRejectedRate recording
                   brokerTopicStats.topicStats(topicPartition.topic).bytesRejectedRate.mark(records.sizeInBytes)
                   brokerTopicStats.allTopicsStats.bytesRejectedRate.mark(records.sizeInBytes)
                   throw new RecordTooLargeException(s"Message batch size is ${batch.sizeInBytes} bytes in append to" +
-                    s"partition $topicPartition which exceeds the maximum configured size of ${config.maxMessageSize}.")
+                    s"partition $topicPartition which exceeds the maximum configured size of 1073741824.")
                 }
               }
             }
@@ -1420,11 +1420,11 @@ class Log(@volatile private var _dir: File,
 
       // Check if the message sizes are valid.
       val batchSize = batch.sizeInBytes
-      if (!ignoreRecordSize && batchSize > config.maxMessageSize) {
+      if (!ignoreRecordSize && batchSize > 1073741824) {
         brokerTopicStats.topicStats(topicPartition.topic).bytesRejectedRate.mark(records.sizeInBytes)
         brokerTopicStats.allTopicsStats.bytesRejectedRate.mark(records.sizeInBytes)
         throw new RecordTooLargeException(s"The record batch size in the append to $topicPartition is $batchSize bytes " +
-          s"which exceeds the maximum configured value of ${config.maxMessageSize}.")
+          s"which exceeds the maximum configured value of 1073741824.")
       }
 
       // check the validity of the message by checking CRC
