@@ -830,7 +830,9 @@ public final class QuorumController implements Controller {
                 List<ApiMessageAndVersion> records = new ArrayList<>();
                 boolean movingLeadersForShutDown = false;
                 if (request.wantShutDown()) {
+                    log.info("Start removing leaderships for broker {}", request.brokerId());
                     records = replicationControl.removeLeaderships(request.brokerId());
+                    log.info("Done removing leaderships for broker {} - Number of records: {}", request.brokerId(), records.size());
                     movingLeadersForShutDown = !records.isEmpty();
                 }
                 ControllerResult<BrokerHeartbeatReply> result = clusterControl.
@@ -846,6 +848,7 @@ public final class QuorumController implements Controller {
             @Override
             public void processBatchEndOffset(long offset) {
                 if (updateShutdownOffset) {
+                    log.info("Controlled shutdown offset for broker {}: {}", request.brokerId(), offset);
                     clusterControl.updateShutdownOffset(request.brokerId(), offset);
                 }
             }

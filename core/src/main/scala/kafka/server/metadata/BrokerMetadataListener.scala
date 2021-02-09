@@ -126,7 +126,7 @@ class BrokerMetadataListener(val brokerId: Int,
       _highestMetadataOffset = lastOffset
       val endNs = time.nanoseconds()
       val deltaUs = TimeUnit.MICROSECONDS.convert(endNs - startNs, TimeUnit.NANOSECONDS)
-      debug(s"Metadata batch ${lastOffset}: advanced highest metadata offset in ${deltaUs} " +
+      info(s"Metadata batch ${lastOffset}: advanced highest metadata offset in ${deltaUs} " +
         "microseconds.")
       batchProcessingTimeHist.update(deltaUs)
     }

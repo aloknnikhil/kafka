@@ -331,6 +331,10 @@ class ControllerApis(val requestChannel: RequestChannel,
     val heartbeatRequest = request.body[BrokerHeartbeatRequest]
     authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)
 
+    if (heartbeatRequest.data().wantShutDown) {
+      logger.info(s"Broker ${heartbeatRequest.data().brokerId()} wants to shutdown")
+    }
+
     controller.processBrokerHeartbeat(heartbeatRequest.data).handle[Unit]((reply, e) => {
       def createResponseCallback(requestThrottleMs: Int,
                                  reply: BrokerHeartbeatReply,

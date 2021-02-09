@@ -369,12 +369,12 @@ public class BrokerHeartbeatManager {
         }
         long curOffset = lowestActiveOffset();
         if (curOffset >= broker.shutdownOffset) {
-            log.debug("broker {} should shut down. The current lowest active offset, {} " +
+            log.info("broker {} should shut down. The current lowest active offset, {} " +
                 "is greater or equal to the broker shutdown offset of {}", brokerId,
                 curOffset, broker.shutdownOffset);
             return true;
         } else {
-            log.debug("broker {} must wait to shut down. The current lowest active offset, {} " +
+            log.info("broker {} must wait to shut down. The current lowest active offset, {} " +
                     "is lower than the broker shutdown offset of {}", brokerId,
                 curOffset, broker.shutdownOffset);
             return false;
