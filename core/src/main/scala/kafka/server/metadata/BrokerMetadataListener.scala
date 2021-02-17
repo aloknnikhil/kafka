@@ -118,8 +118,10 @@ class BrokerMetadataListener(val brokerId: Int,
         if (isDebugEnabled) {
           debug(s"Metadata batch ${lastOffset}: applying partition changes")
         }
+        info("Tell Replica Manager to handle records")
         replicaManager.handleMetadataRecords(imageBuilder, lastOffset,
           RequestHandlerHelper.onLeadershipChange(groupCoordinator, txnCoordinator, _, _))
+        info("Replica Manager finished handling records")
       } else if (isDebugEnabled) {
         debug(s"Metadata batch ${lastOffset}: no partition changes found.")
       }

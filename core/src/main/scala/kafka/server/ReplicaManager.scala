@@ -1841,17 +1841,21 @@ class ReplicaManager(val config: KafkaConfig,
           changedPartitionsPreviouslyExisting.add))
       val nextBrokers = imageBuilder.nextBrokers()
       val highWatermarkCheckpoints = new LazyOffsetCheckpoints(this.highWatermarkCheckpoints)
+      stateChangeLogger.info(s"Start making ${partitionsToBeLeader.size} leaders")
       val partitionsBecomeLeader = if (partitionsToBeLeader.nonEmpty)
         makeLeaders(changedPartitionsPreviouslyExisting, partitionsToBeLeader,
           highWatermarkCheckpoints, metadataOffset)
       else
         Set.empty[Partition]
+      stateChangeLogger.info("Stop making leaders")
+      stateChangeLogger.info(s"Start making ${partitionsToBeFollower.size} followers")
       val partitionsBecomeFollower = if (partitionsToBeFollower.nonEmpty)
         makeFollowers(changedPartitionsPreviouslyExisting, nextBrokers, partitionsToBeFollower, highWatermarkCheckpoints,
           metadataOffset)
       else {
         Set.empty[Partition]
       }
+      stateChangeLogger.info("Stop making followers")
       stateChangeLogger.info(s"Deferring metadata changes for ${partitionChangesToBeDeferred.size} partition(s)")
       if (partitionChangesToBeDeferred.nonEmpty) {
         makeDeferred(imageBuilder, partitionChangesToBeDeferred, metadataOffset, onLeadershipChange)
