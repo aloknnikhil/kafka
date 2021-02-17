@@ -106,7 +106,7 @@ class CheckpointFile[T](val file: File,
           }
 
           writer.flush()
-          //fileOutputStream.getFD().sync()
+          fileOutputStream.getFD().sync()
         } finally {
           writer.close()
         }
