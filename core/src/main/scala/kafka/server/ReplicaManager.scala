@@ -16,6 +16,12 @@
  */
 package kafka.server
 
+import java.io.File
+import java.util.Optional
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
+import java.util.concurrent.locks.Lock
+
 import com.yammer.metrics.core.Meter
 import kafka.api._
 import kafka.cluster.{BrokerEndPoint, Partition}
@@ -23,22 +29,23 @@ import kafka.common.RecordValidationException
 import kafka.controller.{KafkaController, StateChangeLogger}
 import kafka.log._
 import kafka.metrics.KafkaMetricsGroup
+import kafka.server.{FetchMetadata => SFetchMetadata}
 import kafka.server.QuotaFactory.QuotaManagers
 import kafka.server.checkpoints.{LazyOffsetCheckpoints, OffsetCheckpointFile, OffsetCheckpoints}
 import kafka.server.metadata.{ConfigRepository, MetadataBroker, MetadataBrokers, MetadataImageBuilder, MetadataPartition, ZkConfigRepository}
-import kafka.server.{FetchMetadata => SFetchMetadata}
-import kafka.utils.Implicits._
 import kafka.utils._
+import kafka.utils.Implicits._
 import kafka.zk.{AdminZkClient, KafkaZkClient}
+import org.apache.kafka.common.{ElectionType, IsolationLevel, Node, TopicPartition}
 import org.apache.kafka.common.errors._
 import org.apache.kafka.common.internals.Topic
-import org.apache.kafka.common.message.DeleteRecordsResponseData.DeleteRecordsPartitionResult
 import org.apache.kafka.common.message.LeaderAndIsrRequestData.LeaderAndIsrPartitionState
+import org.apache.kafka.common.message.DeleteRecordsResponseData.DeleteRecordsPartitionResult
+import org.apache.kafka.common.message.{DescribeLogDirsResponseData, FetchResponseData, LeaderAndIsrResponseData}
 import org.apache.kafka.common.message.LeaderAndIsrResponseData.LeaderAndIsrPartitionError
 import org.apache.kafka.common.message.OffsetForLeaderEpochRequestData.OffsetForLeaderTopic
 import org.apache.kafka.common.message.OffsetForLeaderEpochResponseData.{EpochEndOffset, OffsetForLeaderTopicResult}
 import org.apache.kafka.common.message.StopReplicaRequestData.StopReplicaPartitionState
-import org.apache.kafka.common.message.{DescribeLogDirsResponseData, FetchResponseData, LeaderAndIsrResponseData}
 import org.apache.kafka.common.metrics.Metrics
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.protocol.Errors
@@ -52,17 +59,10 @@ import org.apache.kafka.common.requests.FetchResponse.AbortedTransaction
 import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse
 import org.apache.kafka.common.requests._
 import org.apache.kafka.common.utils.Time
-import org.apache.kafka.common.{ElectionType, IsolationLevel, Node, TopicPartition}
 
-import java.io.File
-import java.util
-import java.util.Optional
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
-import java.util.concurrent.locks.Lock
-import java.util.concurrent.{Executors, Future, TimeUnit}
+import scala.jdk.CollectionConverters._
 import scala.collection.{Map, Seq, Set, mutable}
 import scala.compat.java8.OptionConverters._
-import scala.jdk.CollectionConverters._
 
 /*
  * Result metadata of a log append operation on the log
@@ -1941,8 +1941,6 @@ class ReplicaManager(val config: KafkaConfig,
                           defaultMetadataOffset: Long,
                           metadataOffsets: Map[Partition, Long] = Map.empty): Set[Partition] = {
     val partitionsMadeLeaders = mutable.Set[Partition]()
-    val batch = new util.ArrayList[Future[Void]]()
-    val executorService = Executors.newFixedThreadPool(16);
     val traceLoggingEnabled = stateChangeLogger.isTraceEnabled
     val deferredBatches = metadataOffsets.nonEmpty
     val topLevelLogPrefix = if (deferredBatches)
@@ -1955,41 +1953,33 @@ class ReplicaManager(val config: KafkaConfig,
       stateChangeLogger.info(s"$topLevelLogPrefix: stopped ${partitionStates.size} fetcher(s)")
       // Update the partition information to be the leader
       partitionStates.forKeyValue { (partition, state) =>
-        batch.add(executorService.submit(() => {
-          val metadataOffset = metadataOffsets.getOrElse(partition, defaultMetadataOffset)
-          val topicPartition = partition.topicPartition
-          val partitionLogMsgPrefix = if (deferredBatches)
-            s"Apply deferred leader partition $topicPartition last seen in metadata batch $metadataOffset"
-          else
-            s"Metadata batch $metadataOffset $topicPartition"
-          try {
-            val isrState = state.toLeaderAndIsrPartitionState(
-              !prevPartitionsAlreadyExisting(state))
-            if (partition.makeLeader(isrState, highWatermarkCheckpoints)) {
-              partitionsMadeLeaders += partition
-              if (traceLoggingEnabled) {
-                stateChangeLogger.trace(s"$partitionLogMsgPrefix: completed the become-leader state change.")
-              }
-            } else {
-              stateChangeLogger.info(s"$partitionLogMsgPrefix: skipped the " +
-                "become-leader state change since it is already the leader.")
+        val metadataOffset = metadataOffsets.getOrElse(partition, defaultMetadataOffset)
+        val topicPartition = partition.topicPartition
+        val partitionLogMsgPrefix = if (deferredBatches)
+          s"Apply deferred leader partition $topicPartition last seen in metadata batch $metadataOffset"
+        else
+          s"Metadata batch $metadataOffset $topicPartition"
+        try {
+          val isrState = state.toLeaderAndIsrPartitionState(
+            !prevPartitionsAlreadyExisting(state))
+          if (partition.makeLeader(isrState, highWatermarkCheckpoints)) {
+            partitionsMadeLeaders += partition
+            if (traceLoggingEnabled) {
+              stateChangeLogger.trace(s"$partitionLogMsgPrefix: completed the become-leader state change.")
             }
-            null
-          } catch {
-            case e: KafkaStorageException =>
-              stateChangeLogger.error(s"$partitionLogMsgPrefix: unable to make " +
-                s"leader because the replica for the partition is offline due to disk error $e")
-              val dirOpt = getLogDir(topicPartition)
-              error(s"Error while making broker the leader for partition $partition in dir $dirOpt", e)
-              markPartitionOffline(topicPartition)
-              null
+          } else {
+            stateChangeLogger.info(s"$partitionLogMsgPrefix: skipped the " +
+              "become-leader state change since it is already the leader.")
           }
-        }))
+        } catch {
+          case e: KafkaStorageException =>
+            stateChangeLogger.error(s"$partitionLogMsgPrefix: unable to make " +
+              s"leader because the replica for the partition is offline due to disk error $e")
+            val dirOpt = getLogDir(topicPartition)
+            error(s"Error while making broker the leader for partition $partition in dir $dirOpt", e)
+            markPartitionOffline(topicPartition)
+        }
       }
-
-      batch.forEach((leader) => {
-        leader.get()
-      })
     } catch {
       case e: Throwable =>
           stateChangeLogger.error(s"$topLevelLogPrefix: error while processing batch.", e)
